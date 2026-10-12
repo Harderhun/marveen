@@ -90,6 +90,10 @@ describe('contextLimitForModel / calibrateLimit', () => {
     // Sonnet stays 200k: never observed above 198k on this host. Haiku 200k
     // by spec; unknown models stay conservative (calibration steps them up).
     expect(contextLimitForModel('claude-sonnet-5')).toBe(200_000)
+    // Sonnet 5.5 runs a 1M window (status bar 216k/1M, 2026-10-12): the 200k
+    // guess restarted it at ~20% real usage.
+    expect(contextLimitForModel('claude-sonnet-5-5')).toBe(1_000_000)
+    expect(contextLimitForModel('claude-sonnet-5-5[1m]')).toBe(1_000_000)
     expect(contextLimitForModel('claude-haiku-4-5')).toBe(200_000)
     expect(contextLimitForModel('claude-opus-4-5')).toBe(200_000)
     expect(contextLimitForModel('deepseek-v4-pro')).toBe(200_000)
