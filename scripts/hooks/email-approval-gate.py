@@ -386,6 +386,12 @@ def standing_match(env: dict, standing):
     an allow."""
     if not standing:
         return None
+    # A harder-mail reply is addressed by its original (reply_to), not by `to`:
+    # the `to` the envelope holds is then a made-up anchor token, and an address
+    # typed into reply_folder / reply_to_uid parses out of it as a recipient
+    # (security review of HARDERMAILGATES1019). Such a letter is never on the list.
+    if env.get("reply_to"):
+        return None
     for field in ("cc", "bcc"):
         if any(str(v).strip() for v in (env.get(field) or [])):
             return None

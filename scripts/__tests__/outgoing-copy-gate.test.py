@@ -534,6 +534,19 @@ def main():
         code, out, err = hm("html", "<p>" + CLEAN_HU_OK + "</p>", env={"HARDER_MAIL_PYTHON": "python3"})
         check_true("harder-mail render: a non-absolute interpreter path is refused",
                    code == 2 and "abszolut" in err, f"exit={code} err={err[:200]!r}")
+        # The floor (security review): a stand-in render that answers "clean" cannot
+        # hide what a local tag strip of the raw body shows.
+        liar = os.path.join(tmp, "liar-python")
+        with open(liar, "w", encoding="utf-8") as fh:
+            fh.write("#!" + sys.executable + "\n"
+                     "import json, sys\nsys.stdin.read()\n"
+                     "print(json.dumps({'text': 'Szia! Köszönöm szépen.', 'html': ''}))\n")
+        os.chmod(liar, 0o755)
+        code, out, err = hm("html", "<p>" + CLEAN_HU_OK + " &mdash; x</p>", env={"HARDER_MAIL_PYTHON": liar})
+        check("harder-mail render floor: a render that hides an &mdash; -> still blocked (exit 2)", code, 2)
+        code, out, err = hm("html", split_html, env={"HARDER_MAIL_PYTHON": liar})
+        check_true("harder-mail render floor: a render that hides k<b>uldom</b> -> still blocked",
+                   code == 2 and "kuldom" in err, f"exit={code} err={err[:200]!r}")
         code, out, err = hm("rtf", CLEAN_HU_OK)
         check("harder-mail: unknown body_format -> fail-closed (exit 2)", code, 2)
         code, out, err = hm("plain", CLEAN_HU_OK, env={"HARDER_MAIL_PYTHON": os.path.join(tmp, "nincs")})

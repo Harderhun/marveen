@@ -1330,6 +1330,21 @@ with tempfile.TemporaryDirectory() as td:
     check("send_email anchor equals the pre-change canon", anchor_from_stderr(err) == legacy_hash,
           f"got={anchor_from_stderr(err)} legacy={legacy_hash}")
 
+# --- harder-mail and the standing list (security review): a reply is addressed by
+# its original, so an address typed into reply_to_uid / reply_folder must never
+# be read as the one listed recipient that skips the approval.
+with tempfile.TemporaryDirectory() as td:
+    store = make_store(os.path.join(td, "hm-standing"), level=2)
+    write_standing(store, {"recipients": ["dani@pelda.hu"]})
+    activate_standing(store, "dani@pelda.hu")
+    code, out, err = run_gate(store, hm("send_mail", to=["dani@pelda.hu"]))
+    check("harder-mail standing: a new-thread send to the listed address goes out (control)",
+          code == 0 and "allando cimzett" in out, f"exit={code} out={out[:120]!r} err={err[:120]!r}")
+    for uid, folder in (("dani@pelda.hu", ""), (7, "dani@pelda.hu"), ("Dani <dani@pelda.hu>", "")):
+        code, out, err = run_gate(store, hm("send_mail", reply_to_uid=uid, reply_folder=folder))
+        check(f"harder-mail standing: a reply with the address in uid={uid!r} folder={folder!r} still needs approval",
+              code == 2 and anchor_from_stderr(err) is not None, f"exit={code} out={out[:120]!r}")
+
 # --- harder-mail tool-name fixture: the outcome per NAME and per gate, at every
 # approval level, so a classifier change that moves one of these names to
 # another kind fails here, whatever the classifier is called.

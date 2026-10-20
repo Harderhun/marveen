@@ -21,6 +21,7 @@ outgoing-copy-gate.py (behavior-neutral; parity proven byte-for-byte against a
 golden captured from the pre-move code -- scripts/__tests__/email-extract-parity.test.py).
 """
 import hashlib
+import html
 import json
 import os
 import re
@@ -424,7 +425,21 @@ def collect_harder_mail_text(tool_input: dict):
     except (ValueError, KeyError, TypeError):
         return "", "a harder-mail render kimenete nem ertelmezheto"
     subject = str(tool_input.get("subject") or "")
-    return "\n".join(part for part in (text, subject) if part), None
+    # The floor (security review): the interpreter comes from config the agent
+    # can write, so a stand-in render could answer "clean". The raw body, its
+    # tags stripped and entities decoded here, is audited too, so the audit is
+    # never weaker than a deterministic local reading of the same letter.
+    floor = _strip_markup(str(tool_input.get("body") or ""))
+    return "\n".join(part for part in (text, floor, subject) if part), None
+
+
+_BLOCK_TAG = re.compile(r"</?(p|div|br|li|ul|ol|h[1-6]|tr|td|th|table|blockquote)\b[^>]*>", re.I)
+
+
+def _strip_markup(body: str) -> str:
+    """Tags out (a block tag is a line break, an inline tag joins its word, so
+    "k<b>uldom</b>" reads "kuldom"), entities decoded."""
+    return html.unescape(re.sub(r"<[^>]*>", "", _BLOCK_TAG.sub("\n", body)))
 
 
 def _harder_send_envelope(ti: dict, to: list, reason):
