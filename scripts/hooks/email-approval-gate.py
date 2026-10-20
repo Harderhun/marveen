@@ -372,6 +372,11 @@ def read_standing():
     return out, None
 
 
+# The recipient-anchor tokens email_extract.collect_email_envelope (and the
+# credential gate) put in `to` for a reply addressed by its original.
+_ANCHOR_TOKEN_PREFIXES = ("messageId:", "reply_to:")
+
+
 def standing_match(env: dict, standing):
     """The address this letter may be sent to WITHOUT an approval, or None.
 
@@ -391,6 +396,15 @@ def standing_match(env: dict, standing):
     # typed into reply_folder / reply_to_uid parses out of it as a recipient
     # (security review of HARDERMAILGATES1019). Such a letter is never on the list.
     if env.get("reply_to"):
+        return None
+    # A reply addressed by its ORIGINAL carries a made-up anchor token in `to`
+    # (messageId:<id> for a connector reply, reply_to:[folder, uid] for a
+    # harder-mail one), not a recipient. getaddresses reads an address typed
+    # into the id as THE one listed recipient, and the reply -- whose real
+    # recipient is the original's sender -- went out without an approval
+    # (measured 2026-10-20: messageId "<listed@addr>" -> exit 0 at level 2).
+    # A letter whose `to` holds such a token is never on the list.
+    if any(str(v).startswith(_ANCHOR_TOKEN_PREFIXES) for v in (env.get("to") or [])):
         return None
     for field in ("cc", "bcc"):
         if any(str(v).strip() for v in (env.get(field) or [])):

@@ -23,6 +23,7 @@ import json
 import os
 import re
 import hashlib
+import importlib.util
 import shutil
 import sqlite3
 import subprocess
@@ -561,6 +562,23 @@ with tempfile.TemporaryDirectory() as td:
     code, _, err = run_gate(store, mcp_send(to="idegen@pelda.hu"))
     check("standing: a listan NEM szereplo cimre tovabbra is jovahagyas kell",
           code == 2 and "NINCS jovahagyas" in err, f"exit={code}")
+
+    # A reply addressed by its original carries an anchor TOKEN in `to`, not a
+    # recipient: an address typed into the messageId must not read as the one
+    # listed recipient (measured before the fix: exit 0, no approval).
+    for mid in ("<dani@pelda.hu>", "dani@pelda.hu", "Dani <dani@pelda.hu>"):
+        code, out, err = run_gate(store, connector("reply", messageId=mid, body="Kedves Ügyfelünk! Válasz."))
+        check(f"standing: a connector reply with messageId={mid!r} still needs approval",
+              code == 2 and anchor_from_stderr(err) is not None, f"exit={code} out={out[:120]!r}")
+    _spec = importlib.util.spec_from_file_location("eag_standing", GATE)
+    _eag = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_eag)
+    listed = {"dani@pelda.hu"}
+    for tok in ('messageId:<dani@pelda.hu>', 'reply_to:["", "dani@pelda.hu"]', 'reply_to:["dani@pelda.hu", "7"]'):
+        got = _eag.standing_match({"to": [tok], "cc": [], "bcc": []}, listed)
+        check(f"standing_match: the anchor token {tok!r} is never the listed recipient", got is None, f"got={got!r}")
+    check("standing_match: the plain listed address still matches (control)",
+          _eag.standing_match({"to": ["dani@pelda.hu"], "cc": [], "bcc": []}, listed) == "dani@pelda.hu")
 
     # A ketto egyutt a lenyeg: a lista NEM a level helyettesitoje.
     store1 = make_store(os.path.join(td, "sl2"), level=1)
