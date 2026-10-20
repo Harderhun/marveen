@@ -695,6 +695,9 @@ const MANAGE_EMAIL_SEND_OPS = new Set(['send', 'reply', 'replyall', 'forward'])
 // 'draft' | null (reads, search, labels, delete: not outbound).
 const CONNECTOR_GENERIC_SUFFIXES = ['send_message', 'reply', 'forward']
 const DRAFT_NAMES = ['draft_email', 'create_draft', 'update_draft', 'draft_gmail_message']
+// The harder-mail MCP's sends (HARDERMAILGATES1019): connector_send, so the
+// thread-reply narrowing (send_email only) can never release one.
+const MAILBOX_SEND_SUFFIXES = ['send_mail', 'send_mail_auto']
 
 export function classifyMailTool(toolName) {
   const n = String(toolName ?? '').toLowerCase()
@@ -703,6 +706,7 @@ export function classifyMailTool(toolName) {
   if (n.includes('send_email') || n.includes('send_gmail_message')) return 'send_email'
   if (n.endsWith('reply_all')) return 'connector_send'
   if (n.includes('gmail') && CONNECTOR_GENERIC_SUFFIXES.some((b) => n.endsWith(b))) return 'connector_send'
+  if (MAILBOX_SEND_SUFFIXES.some((b) => n.endsWith(b))) return 'connector_send'
   if (n.endsWith('send_draft')) return 'send_draft'
   if (n.endsWith('manage_email')) return 'manage_email'
   if (DRAFT_NAMES.some((d) => n.includes(d))) return 'draft'

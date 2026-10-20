@@ -956,7 +956,10 @@ export function hasThreadReplyCapability(name: string, capabilities: string[]): 
 // is `..._telegram__reply`, and the email gates must never fire on it. The
 // `[Gg][Mm][Aa][Ii][Ll].*<word>` form is case-insensitive like the
 // classifiers' lowercased test, and it also reaches a "gmail" that sits in a
-// tool PREFIX (mcp__mail__gmail_reply), which `[Gg]mail.*__` cannot. Kept a
+// tool PREFIX (mcp__mail__gmail_reply), which `[Gg]mail.*__` cannot.
+// `.*send_mail.*` is the harder-mail MCP's send_mail / send_mail_auto
+// (HARDERMAILGATES1019, measured 2026-10-19: no email hook fired on them); its
+// create_draft is already the create_draft alternative. Kept a
 // FLAT alternation (no inner `|`): the drift test splits it on '|'.
 // Binding: email-gate-matcher-drift.test.ts asserts this matcher fires for
 // every name either classifier gates, and never for the Telegram tools.
@@ -964,6 +967,7 @@ export const EMAIL_GATE_MATCHER =
   'Bash|.*send_email.*|.*manage_email.*|.*[Gg]mail.*__.*|.*draft_email.*'
   + '|.*send_draft.*|.*update_draft.*|.*create_draft.*|.*reply_all.*|.*send_gmail_message.*|.*draft_gmail_message.*'
   + '|.*[Gg][Mm][Aa][Ii][Ll].*send_message.*|.*[Gg][Mm][Aa][Ii][Ll].*reply.*|.*[Gg][Mm][Aa][Ii][Ll].*forward.*'
+  + '|.*send_mail.*'
 
 // Does an existing PreToolUse array carry an email-gate entry whose matcher is
 // NOT the current one? Pure + exported: this is the predicate that lets
@@ -2643,12 +2647,12 @@ export function buildEvidenceBody(isMainAgent = false, mainLedger = mainAgentRec
       ]
     : isMainAgent
     ? [
-        'Kimenő levélnél a címzett-ledger (`store/verified-recipients.json`) **nálad NEM gépi kapu**: az `email-send-gate.mjs` hook csak a sub-ügynökök settingsébe van bekötve, a tiédbe nem (mérve 2026-09-22). Ami nálad fut, az a jóváhagyás-kapu (a küldés csak a boríték -- címzett, cc, bcc, tárgy, törzs -- hash-ére adott, el nem használt jóváhagyás mellett megy át) és a magyar copy-kapu (ékezet és szöveg-QA a küldés előtt), mindkettő a `scripts/hooks/` alatt. Ezek a KÜLDÉST szigorúan kapuzzák, de a **címet nem mérik a ledgerhez**: egy rossz cím pontosan úgy megy be a jóváhagyásba, ahogy te írtad. A címforrás-szabály nálad tehát szabály, nem gép -- ne olvasd védelemnek ott, ahol nincs.',
+        'Kimenő levélnél a címzett-ledger (`store/verified-recipients.json`) **nálad NEM gépi kapu**: az `email-send-gate.mjs` hook csak a sub-ügynökök settingsébe van bekötve, a tiédbe nem (mérve 2026-09-22). Ami nálad fut, az a jóváhagyás-kapu (a küldés csak a boríték -- címzett, cc, bcc, tárgy, törzs -- hash-ére adott, el nem használt jóváhagyás mellett megy át) és a magyar copy-kapu (ékezet és szöveg-QA a küldés előtt), mindkettő a `scripts/hooks/` alatt. Melyik eszközre melyik fut: a jóváhagyás-kapu CSAK a tényleges küldésre (Bash-ból indított levélküldés, `send_email`, a `manage_email` küldő művelete, a Gmail-connector `send_message`/`reply`/`forward` eszköze, a harder-mail `send_mail` és `send_mail_auto` eszköze); a piszkozat (`create_draft`, `draft_email`, `update_draft`, a harder-mail `create_draft`-ja is) NEM kér jóváhagyást. A copy-kapu a küldést ÉS a piszkozatot is vizsgálja, a harder-mail eszközökét is (mérve 2026-10-19: előtte a harder-mail eszközeire egyik kapu sem futott). Ezek a KÜLDÉST szigorúan kapuzzák, de a **címet nem mérik a ledgerhez**: egy rossz cím pontosan úgy megy be a jóváhagyásba, ahogy te írtad. A címforrás-szabály nálad tehát szabály, nem gép -- ne olvasd védelemnek ott, ahol nincs.',
         '',
         'A ledger ettől még a flottáé: a sub-ügynökök küldését méri, és ha nekik kell egy cím, forrással veszed fel. A ledger bekötése a fő ügynökre külön, gazda-döntés: magadtól ne kösd be, és ne is számolj vele, amíg nincs bekötve.',
       ]
     : [
-        'Kimenő levélnél van gépi kapu is, de **szűkebb, mint a szabály** -- és a különbség csendes, ezért tudni kell róla. Amit a PreToolUse hook lát: a `to`/`cc`/`bcc` mezőt **hordozó** tool-hívást (küldés, piszkozat). Azt a `store/verified-recipients.json` ledgerhez méri, és ismeretlen címre nem engedi át. **Amit NEM lát: a szkriptbe zárt címet.** Ha a levelet egy futtatott szkript állítja össze (`python3 kuldes.py`), a címzett a hook elől rejtve marad; ezt a kapu forrása maga mondja ki, mert tetszőleges értelmezőkód statikus elemzése eldönthetetlen. A gépi kapu tehát a szabály EGY részét fedi le, a maradékot a szabály tartja -- **ne olvasd védelemnek ott, ahol nincs.**',
+        'Kimenő levélnél van gépi kapu is, de **szűkebb, mint a szabály** -- és a különbség csendes, ezért tudni kell róla. Amit a PreToolUse hook lát: a `to`/`cc`/`bcc` mezőt **hordozó** tool-hívást (küldés, piszkozat). Azt a `store/verified-recipients.json` ledgerhez méri, és ismeretlen címre nem engedi át. A harder-mail eszközei közül a `send_mail` és a `send_mail_auto` nálad mindig tiltott, a `create_draft` címzettjét pedig a ledger méri (a válasz-piszkozatnak nincs címzett-mezője, azt a szerver az eredeti levélből oldja fel). **Amit NEM lát: a szkriptbe zárt címet.** Ha a levelet egy futtatott szkript állítja össze (`python3 kuldes.py`), a címzett a hook elől rejtve marad; ezt a kapu forrása maga mondja ki, mert tetszőleges értelmezőkód statikus elemzése eldönthetetlen. A gépi kapu tehát a szabály EGY részét fedi le, a maradékot a szabály tartja -- **ne olvasd védelemnek ott, ahol nincs.**',
         '',
         'És egy következmény, ami a hiányzó ledgerből jön: amíg a `verified-recipients.json` nem létezik, a kapu fail-closed, tehát MINDEN címet hordozó küldés tiltott. Ez helyes irány, de ha egy jóváhagyott, ismétlődő feladat emiatt akad el, a helyes lépés a **cím felvétele forrással** -- nem a kapu megkerülése egy szkripttel. Ha megkerülnéd, állj meg és jelezd.',
       ]
