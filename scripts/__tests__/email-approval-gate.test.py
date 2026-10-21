@@ -570,6 +570,19 @@ with tempfile.TemporaryDirectory() as td:
         code, out, err = run_gate(store, connector("reply", messageId=mid, body="Kedves Ügyfelünk! Válasz."))
         check(f"standing: a connector reply with messageId={mid!r} still needs approval",
               code == 2 and anchor_from_stderr(err) is not None, f"exit={code} out={out[:120]!r}")
+    # A call that names its original never takes the standing path, even with a
+    # listed `to` next to the messageId: reply and reply_all reach the original's
+    # sender or participants, forward carries content the gate never read
+    # (PR #2098 review, measured before the fix: exit 0 for all three).
+    for tool in ("reply", "reply_all", "forward"):
+        code, out, err = run_gate(store, connector(tool, messageId="m1", to=["dani@pelda.hu"],
+                                                   body="Kedves Ügyfelünk! Válasz."))
+        check(f"standing: a connector {tool} with messageId and a listed to still needs approval",
+              code == 2 and anchor_from_stderr(err) is not None, f"exit={code} out={out[:120]!r}")
+    code, out, _ = run_gate(store, connector("send_message", to=["dani@pelda.hu"], subject="T",
+                                             body="Kedves Ügyfelünk! Levél."))
+    check("standing: a connector send_message to the listed address still passes (control)",
+          code == 0 and "allando cimzett" in out, f"exit={code} out={out[:120]!r}")
     _spec = importlib.util.spec_from_file_location("eag_standing", GATE)
     _eag = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_eag)

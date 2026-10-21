@@ -1209,7 +1209,13 @@ def main():
     standing, standing_note = read_standing()
     if standing_note:
         prefix = prefix + f"({standing_note})\n"
-    hit = standing_match(env, standing)
+    # A call that names its original (a connector reply, reply_all or forward)
+    # is never a standing-list send, whatever `to` says: the letter reaches the
+    # original's sender or participants, or carries the original's content,
+    # none of which this gate read. The envelope only shows the messageId as a
+    # `to` token when `to` is empty, so this is decided on the call itself
+    # (PR #2098 review: messageId + a listed `to` -> exit 0 at level 2).
+    hit = None if tool_input.get("messageId") else standing_match(env, standing)
     if hit:
         # The list makes the address a CANDIDATE; only the owner's one-time
         # approval makes it live. Checked before the trace, because an address
