@@ -36,11 +36,11 @@
 //     have their own paths;
 //   - editing a LIVE skill's SKILL.md through PUT /api/skills/:name;
 //   - who approves: since kanban 2c72e07c the approve and reject routes take
-//     only an owner credential (a dashboard login session or a full-scope
-//     device key), not the shared dashboard token every agent holds. That makes
-//     "only a human approves" hold as far as the dashboard can tell a human
-//     apart; an agent able to read a device key or hijack the owner's browser
-//     session is outside it (per-agent identity, #1985).
+//     the owner's session (mayIssueCredentials, the #2163 predicate), not the
+//     shared dashboard token every agent holds; the bare token only before the
+//     first dashboard login exists. That makes "only a human approves" hold as
+//     far as the dashboard can tell a human apart; an agent able to hijack the
+//     owner's browser session is outside it (per-agent identity, #1985).
 
 import { createHash, randomBytes } from 'node:crypto'
 import { execFileSync } from 'node:child_process'

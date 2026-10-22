@@ -1,9 +1,12 @@
 // Kanban 2c72e07c: the decision on a quarantined skill is the owner's. Measured before this fix: a
 // caller with the shared dashboard token (which every agent holds) read a pending skill's hash with
 // GET /api/skills/pending/<id> and approved it, and the skill went live in the GLOBAL root the whole
-// fleet loads. Approve and reject now take only an owner credential: a dashboard login session or a
-// full-scope device key.
-import { describe, it, expect, vi, afterAll } from 'vitest'
+// fleet loads. Approve and reject now go through the predicate that guards issuing credentials
+// (mayIssueCredentials, #2163): the owner's session, also when the browser sends the stored token
+// alongside it; the bare token only before the first dashboard login exists.
+import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest'
+import type http from 'node:http'
+import { Readable } from 'node:stream'
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,15 +26,19 @@ vi.mock('../config.js', async (importOriginal) => ({
 
 const q = await import('../web/skill-quarantine.js')
 const { tryHandleSkills } = await import('../web/routes/skills.js')
+const { tryHandleAuth } = await import('../web/routes/auth.js')
+const { initDatabase, getDb } = await import('../db.js')
+const { _clearSessionCacheForTest, createSession } = await import('../web/auth-sessions.js')
+const { SESSION_COOKIE_NAME } = await import('../web/auth-gate.js')
+type Auth = import('../web/routes/types.js').RouteContext['auth']
 
-type Auth = { kind: 'token' | 'session' | 'device'; agent?: string; user?: string; scope?: 'full' | 'operator' }
-async function call(method: string, path: string, body: unknown, auth: Auth) {
+async function call(method: string, path: string, body: unknown, auth: Auth, headers: Record<string, string> = {}, handler = tryHandleSkills) {
   const out: { status: number; body: any } = { status: 0, body: null }
   const res: any = { writeHead(s: number) { out.status = s; return res }, setHeader() {}, end(c?: string) { if (c) try { out.body = JSON.parse(c) } catch { out.body = c } } }
-  const str = body === undefined ? '' : JSON.stringify(body)
-  const req: any = { headers: {}, on(ev: string, cb: (c?: Buffer) => void) { if (ev === 'data' && str) cb(Buffer.from(str)); if (ev === 'end') cb() } }
+  const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]) as unknown as http.IncomingMessage
+  req.headers = headers
   const url = new URL(`http://localhost${path}`)
-  expect(await tryHandleSkills({ req, res, path: url.pathname, method, url, auth } as any)).toBe(true)
+  expect(await handler({ req, res, path: url.pathname, method, url, auth } as any)).toBe(true)
   return out
 }
 function queue(name: string) {
@@ -39,39 +46,73 @@ function queue(name: string) {
   return { meta, live: join(tmpHome, '.claude', 'skills', name, 'SKILL.md') }
 }
 const TOKEN: Auth = { kind: 'token', agent: 'soma' }
+const SESSION: Auth = { kind: 'session', user: 'owner' }
+const hashOf = async (id: string) => (await call('GET', `/api/skills/pending/${id}`, undefined, TOKEN)).body.hash
+const addOwner = () => call('POST', '/api/auth/users', { username: 'owner', password: 'super-secret-pw' }, TOKEN, {}, tryHandleAuth)
 
-describe('pending skill approve/reject: owner credential only', () => {
-  it('the shared token can still read the hash, but approving with it is 403 and nothing goes live', async () => {
+beforeAll(() => { process.env.NODE_ENV = 'test'; initDatabase(':memory:') })
+beforeEach(() => {
+  getDb().exec('DELETE FROM auth_sessions; DELETE FROM dashboard_users')
+  _clearSessionCacheForTest()
+})
+
+describe('pending skill approve/reject: the owner session (mayIssueCredentials)', () => {
+  it('once a login exists, the shared token can still read the hash, but approving with it is 403 and nothing goes live', async () => {
+    expect((await addOwner()).status).toBe(201)
     const { meta, live } = queue('planted-by-token')
-    const detail = await call('GET', `/api/skills/pending/${meta.id}`, undefined, TOKEN)
-    expect(detail.status).toBe(200)
-    const r = await call('POST', `/api/skills/pending/${meta.id}/approve`, { hash: detail.body.hash }, TOKEN)
+    const r = await call('POST', `/api/skills/pending/${meta.id}/approve`, { hash: await hashOf(meta.id) }, TOKEN)
     expect(r.status).toBe(403)
-    expect(r.body.error).toMatch(/owner/)
+    expect(r.body.code).toBe('owner_session_required')
     expect(existsSync(live)).toBe(false)
     expect(q.getPending(meta.id)).not.toBeNull()
   })
 
   it('rejecting with the shared token is 403 too: what waits for the owner stays', async () => {
+    await addOwner()
     const { meta } = queue('kept-for-owner')
     expect((await call('POST', `/api/skills/pending/${meta.id}/reject`, undefined, TOKEN)).status).toBe(403)
     expect(q.getPending(meta.id)).not.toBeNull()
   })
 
-  it('an operator-scope device key is a limited key and is refused as well', async () => {
-    const { meta } = queue('operator-key')
-    const hash = (await call('GET', `/api/skills/pending/${meta.id}`, undefined, TOKEN)).body.hash
-    expect((await call('POST', `/api/skills/pending/${meta.id}/approve`, { hash }, { kind: 'device', scope: 'operator' })).status).toBe(403)
-  })
-
-  it('the owner session approves and the skill goes live; a full-scope device key may reject', async () => {
-    const { meta, live } = queue('owner-approved')
-    const hash = (await call('GET', `/api/skills/pending/${meta.id}`, undefined, TOKEN)).body.hash
-    const ok = await call('POST', `/api/skills/pending/${meta.id}/approve`, { hash }, { kind: 'session', user: 'owner' })
+  it('the owner\'s browser that sends the stored token AND a live session cookie approves (no 403 for the owner)', async () => {
+    await addOwner()
+    const { meta, live } = queue('owner-browser')
+    const owner = getDb().prepare('SELECT id FROM dashboard_users WHERE username = ?').get('owner') as { id: number }
+    const cookie = `${SESSION_COOKIE_NAME}=${createSession({ userId: owner.id, username: 'owner' })}`
+    const ok = await call('POST', `/api/skills/pending/${meta.id}/approve`, { hash: await hashOf(meta.id) }, TOKEN, { cookie })
     expect(ok.status).toBe(200)
     expect(readFileSync(live, 'utf-8')).toContain('# planted')
-    const other = queue('device-rejected')
-    expect((await call('POST', `/api/skills/pending/${other.meta.id}/reject`, undefined, { kind: 'device', scope: 'full' })).status).toBe(200)
+  })
+
+  it('the token with a dead or forged session cookie is still the bare token: 403', async () => {
+    await addOwner()
+    const { meta } = queue('forged-cookie')
+    const r = await call('POST', `/api/skills/pending/${meta.id}/approve`, { hash: await hashOf(meta.id) }, TOKEN, { cookie: `${SESSION_COOKIE_NAME}=not-a-session` })
+    expect(r.status).toBe(403)
+  })
+
+  it('a device key is not an owner session, whatever its scope', async () => {
+    await addOwner()
+    const { meta } = queue('device-key')
+    const hash = await hashOf(meta.id)
+    expect((await call('POST', `/api/skills/pending/${meta.id}/approve`, { hash }, { kind: 'device', scope: 'operator' } as Auth)).status).toBe(403)
+    expect((await call('POST', `/api/skills/pending/${meta.id}/reject`, undefined, { kind: 'device', scope: 'full' } as Auth)).status).toBe(403)
+    expect(q.getPending(meta.id)).not.toBeNull()
+  })
+
+  it('the owner session approves and rejects', async () => {
+    await addOwner()
+    const { meta, live } = queue('owner-approved')
+    expect((await call('POST', `/api/skills/pending/${meta.id}/approve`, { hash: await hashOf(meta.id) }, SESSION)).status).toBe(200)
+    expect(readFileSync(live, 'utf-8')).toContain('# planted')
+    const other = queue('owner-rejected')
+    expect((await call('POST', `/api/skills/pending/${other.meta.id}/reject`, undefined, SESSION)).status).toBe(200)
     expect(q.getPending(other.meta.id)).toBeNull()
+  })
+
+  it('before the first dashboard login exists, the token is the one credential there is: it may decide', async () => {
+    const { meta, live } = queue('first-run')
+    expect((await call('POST', `/api/skills/pending/${meta.id}/approve`, { hash: await hashOf(meta.id) }, TOKEN)).status).toBe(200)
+    expect(existsSync(live)).toBe(true)
   })
 })
