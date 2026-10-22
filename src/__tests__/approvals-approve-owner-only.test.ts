@@ -7,9 +7,11 @@
 //      resolved_by -> approved -> the gate let the letter through;
 //   3. the same born-approved POST for STANDING_CATEGORY (email_standing_recipient) -> every later
 //      letter to that address went out with no approval at all.
-// Approving (the born-approved POST and PATCH status=approved) now takes an owner credential: a
-// dashboard login session or a full-scope device key. Reject and timeout stay open to the token:
-// with them an agent can only cancel a request, never gain a right.
+// Approving (the born-approved POST and PATCH status=approved) now goes through the predicate that
+// guards issuing credentials (mayIssueCredentials, #2163): the owner's session, also when the
+// browser sends the stored token alongside it (so the owner approving from the dashboard gets no
+// 403); the bare token only before the first dashboard login exists. Reject and timeout stay open
+// to the token: with them an agent can only cancel a request, never gain a right.
 import { describe, it, expect, vi, afterAll } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -22,14 +24,19 @@ vi.mock('../config.js', async (importOriginal) => ({ ...(await importOriginal<ty
 vi.mock('../owner-chat.js', async (importOriginal) => ({ ...(await importOriginal<typeof import('../owner-chat.js')>()), resolveOwnerChatId: () => '777' }))
 vi.mock('../web/telegram.js', async (importOriginal) => ({ ...(await importOriginal<typeof import('../web/telegram.js')>()), sendTelegramMessage: sendSpy }))
 
-import { initDatabase, getApproval, listApprovals } from '../db.js'
+import { initDatabase, getApproval, listApprovals, createDashboardUser, getDb } from '../db.js'
 import { tryHandleApprovals } from '../web/routes/approvals.js'
+import { createSession, _clearSessionCacheForTest } from '../web/auth-sessions.js'
+import { SESSION_COOKIE_NAME } from '../web/auth-gate.js'
 
 const td = mkdtempSync(join(tmpdir(), 'approvals-owner-only-'))
 afterAll(() => rmSync(td, { recursive: true, force: true }))
 const store = join(td, 'store'); mkdirSync(store, { recursive: true })
 writeFileSync(join(store, 'autonomy-config.json'), JSON.stringify({ categories: [{ key: 'email_send', label: 'Email', level: 2, locked: false }] }))
 initDatabase(join(store, 'claudeclaw.db'))
+// A dashboard login exists (the normal state): the bare token no longer counts as the owner.
+const ownerUser = createDashboardUser('owner', 'x'.repeat(60))
+const ownerCookie = () => `${SESSION_COOKIE_NAME}=${createSession({ userId: ownerUser.id, username: 'owner' })}`
 
 type Auth = { kind: 'token' | 'session' | 'device'; agent?: string; user?: string; scope?: 'full' | 'operator' }
 const TOKEN: Auth = { kind: 'token', agent: 'soma' }
@@ -54,18 +61,18 @@ function anchorOf(payload: unknown): string {
   return a as string
 }
 
-async function call(method: 'POST' | 'PATCH', path: string, body: unknown, auth: Auth) {
+async function call(method: 'POST' | 'PATCH', path: string, body: unknown, auth: Auth, headers: Record<string, string> = {}) {
   const out: { status: number; body: any } = { status: 0, body: null }
   const res: any = { writeHead(s: number) { out.status = s; return res }, end(c?: string) { if (c) out.body = JSON.parse(c) } }
   const str = JSON.stringify(body)
-  const req: any = { on(ev: string, cb: (c?: Buffer) => void) { if (ev === 'data') cb(Buffer.from(str)); if (ev === 'end') cb() } }
+  const req: any = { headers, on(ev: string, cb: (c?: Buffer) => void) { if (ev === 'data') cb(Buffer.from(str)); if (ev === 'end') cb() } }
   const url = new URL(`http://localhost${path}`)
   expect(await tryHandleApprovals({ req, res, path: url.pathname, method, url, auth } as any)).toBe(true)
   await new Promise((r) => setImmediate(r))
   return out
 }
-const post = (body: unknown, auth: Auth) => call('POST', '/api/approvals', body, auth)
-const patch = (id: string, body: unknown, auth: Auth) => call('PATCH', `/api/approvals/${id}`, body, auth)
+const post = (body: unknown, auth: Auth, headers: Record<string, string> = {}) => call('POST', '/api/approvals', body, auth, headers)
+const patch = (id: string, body: unknown, auth: Auth, headers: Record<string, string> = {}) => call('PATCH', `/api/approvals/${id}`, body, auth, headers)
 
 describe('born-approved POST (owner_approved_message_id)', () => {
   it('the shared token naming the main agent is 403, no row is written, and the gate stays shut', async () => {
@@ -74,7 +81,7 @@ describe('born-approved POST (owner_approved_message_id)', () => {
     const before = listApprovals({ limit: 500 }).length
     const r = await post({ agent_id: 'marveen', category: 'email_send', action_description: 'x', content_hash: anchor, owner_approved_message_id: 1 }, TOKEN)
     expect(r.status).toBe(403)
-    expect(r.body.error).toMatch(/owner/)
+    expect(r.body.code).toBe('owner_session_required')
     expect(listApprovals({ limit: 500 }).length).toBe(before)
     expect(gate(p).code).toBe(2)
   })
@@ -107,9 +114,16 @@ describe('PATCH status=approved', () => {
     expect(gate(p).code).toBe(2)
   })
 
-  it('an operator-scope device key is a limited key and is refused as well', async () => {
+  it('a device key is not an owner session, whatever its scope', async () => {
     const own = await post({ agent_id: 'soma', category: 'email_send', action_description: 'z' }, TOKEN)
     expect((await patch(own.body.id, { status: 'approved', resolved_by: 'dashboard' }, { kind: 'device', scope: 'operator' })).status).toBe(403)
+    expect((await patch(own.body.id, { status: 'approved', resolved_by: 'dashboard' }, { kind: 'device', scope: 'full' })).status).toBe(403)
+    expect(getApproval(own.body.id)?.status).toBe('pending')
+  })
+
+  it('the token with a dead or forged session cookie is still the bare token: 403', async () => {
+    const own = await post({ agent_id: 'soma', category: 'email_send', action_description: 'f' }, TOKEN)
+    expect((await patch(own.body.id, { status: 'approved', resolved_by: 'dashboard' }, TOKEN, { cookie: `${SESSION_COOKIE_NAME}=not-a-session` })).status).toBe(403)
     expect(getApproval(own.body.id)?.status).toBe('pending')
   })
 
@@ -123,9 +137,13 @@ describe('PATCH status=approved', () => {
     expect(gate(p).code).toBe(0)
   })
 
-  it('POSITIVE CONTROL: a full-scope device key approves', async () => {
-    const own = await post({ agent_id: 'soma', category: 'email_send', action_description: 'v' }, TOKEN)
-    expect((await patch(own.body.id, { status: 'approved', resolved_by: 'dashboard' }, { kind: 'device', scope: 'full' })).status).toBe(200)
+  it('the owner\'s browser that sends the stored token AND a live session cookie approves (no 403 on the dashboard)', async () => {
+    const p = letter()
+    const anchor = anchorOf(p)
+    const own = await post({ agent_id: 'soma', category: 'email_send', action_description: 'v', content_hash: anchor }, TOKEN)
+    const r = await patch(own.body.id, { status: 'approved', resolved_by: 'dashboard' }, TOKEN, { cookie: ownerCookie() })
+    expect(r.status).toBe(200)
+    expect(gate(p).code).toBe(0)
   })
 
   it.each(['rejected', 'timeout'])('the token may still resolve a request as %s: that only cancels it', async (status) => {
@@ -160,5 +178,14 @@ describe('standing-recipient activation (STANDING_CATEGORY)', () => {
     expect(r.status).toBe(201)
     expect(gate(letter(addr)).code).toBe(0)
     expect(gate(letter(addr)).code).toBe(0)
+  })
+})
+
+describe('before the first dashboard login exists', () => {
+  it('the token is the one credential there is: it may approve (first-run, as for issuing credentials)', async () => {
+    getDb().exec('DELETE FROM auth_sessions; DELETE FROM dashboard_users')
+    _clearSessionCacheForTest()
+    const own = await post({ agent_id: 'soma', category: 'email_send', action_description: 'first-run' }, TOKEN)
+    expect((await patch(own.body.id, { status: 'approved', resolved_by: 'dashboard' }, TOKEN)).status).toBe(200)
   })
 })

@@ -14,7 +14,7 @@ import { readBody, json } from '../http-helpers.js'
 import { resolveOwnerChatId } from '../../owner-chat.js'
 import { sendOwnerMessage } from '../../notify.js'
 import { sendTelegramMessage } from '../telegram.js'
-import { isOwnerCredential } from '../owner-credential.js'
+import { mayIssueCredentials, OWNER_SESSION_REQUIRED } from './auth.js'
 import type { RouteContext } from './types.js'
 
 // Kanban 80d0e3c6: APPROVING is the owner's decision, so the two routes that make a row approved
@@ -23,8 +23,14 @@ import type { RouteContext } from './types.js'
 // the real email-approval-gate then let its letter through; through STANDING_CATEGORY the same
 // row made every later letter to an address approval-free. The self-declared agent_id and
 // resolved_by checks below stay, but they were never what stopped this.
-const OWNER_ONLY_ERROR = 'approving needs the owner\'s dashboard login (session) or a full-scope device key; ' +
-  'the shared dashboard token can file, reject or time out a request, not approve one'
+// Who counts as the owner is the predicate that guards issuing credentials (mayIssueCredentials,
+// #2163): the owner's session, also when the browser sends the stored token alongside it; the
+// bare token only before the first dashboard login exists.
+const OWNER_ONLY = {
+  ...OWNER_SESSION_REQUIRED,
+  error: 'Approving needs the dashboard login (an owner session); the shared dashboard token can file, reject or time out a request, not approve one. ' +
+    'The token alone approves only before the first login exists.',
+}
 
 const AUTONOMY_CONFIG_PATH = join(PROJECT_ROOT, 'store', 'autonomy-config.json')
 
@@ -440,9 +446,9 @@ export async function tryHandleApprovals(ctx: RouteContext): Promise<boolean> {
     // PATCH writes); a string id is kept in the owner note and the log line.
     let chatApprovedMessageId: number | string | null = null
     if (owner_approved_message_id !== undefined && owner_approved_message_id !== null) {
-      if (!isOwnerCredential(ctx.auth)) {
-        logger.warn({ agent_id, category, auth: ctx.auth?.kind, agent: ctx.auth?.agent }, 'born-approved approval refused: not an owner credential')
-        json(res, { error: OWNER_ONLY_ERROR }, 403)
+      if (!mayIssueCredentials(ctx.auth, req)) {
+        logger.warn({ agent_id, category, auth: ctx.auth?.kind, agent: ctx.auth?.agent }, 'born-approved approval refused: no owner session')
+        json(res, OWNER_ONLY, 403)
         return true
       }
       if (agent_id.trim() !== MAIN_AGENT_ID) {
@@ -598,11 +604,11 @@ export async function tryHandleApprovals(ctx: RouteContext): Promise<boolean> {
     }
     const msgId = typeof telegram_message_id === 'number' ? telegram_message_id : null
 
-    // Approving takes the owner (see OWNER_ONLY_ERROR); rejecting or timing out does not, since
+    // Approving takes the owner (see OWNER_ONLY); rejecting or timing out does not, since
     // an agent that cancels a request gains nothing by it.
-    if (status === 'approved' && !isOwnerCredential(ctx.auth)) {
-      logger.warn({ id: idMatch[1], resolved_by, auth: ctx.auth?.kind, agent: ctx.auth?.agent }, 'approval approve refused: not an owner credential')
-      json(res, { error: OWNER_ONLY_ERROR }, 403)
+    if (status === 'approved' && !mayIssueCredentials(ctx.auth, req)) {
+      logger.warn({ id: idMatch[1], resolved_by, auth: ctx.auth?.kind, agent: ctx.auth?.agent }, 'approval approve refused: no owner session')
+      json(res, OWNER_ONLY, 403)
       return true
     }
 

@@ -429,6 +429,24 @@ is refused by the other.
 A 409 means: do not send, and check the sent mailbox before deciding anything,
 because the earlier attempt may already have gone out.
 
+# Approving takes the owner's session
+
+Approving a request (`PATCH /api/approvals/<id>` with `status=approved`, and the born-approved
+`POST /api/approvals` with `owner_approved_message_id`) goes through the same predicate as issuing
+credentials (`mayIssueCredentials`, #2163): the owner's dashboard session, also when the browser
+sends the stored access token alongside it; the bare token only before the first dashboard login
+exists. The shared token, which every agent holds, can still file a request and resolve it as
+`rejected` or `timeout` (that only cancels it), but no longer approve one: measured before, with it
+any agent made its own letter approved and the email gate let it through (kanban 80d0e3c6). A
+device key is not an owner session, whatever its scope.
+
+What the owner sees:
+- A browser that came in with `?token=` or through the mobile QR now gets a "Sign in with the
+  dashboard password" button (Settings, Security): it drops the stored token, and from then on the
+  browser runs on the owner's session, so approving from it works.
+- A Telegram "YES <id>" (or "IGEN <id>") reply no longer closes an approval: the agent sends the
+  owner to the dashboard instead.
+
 # Memory delete needs an approval (data_delete)
 
 `DELETE /api/memories/:id` is final: the row's versions are purged with it. The

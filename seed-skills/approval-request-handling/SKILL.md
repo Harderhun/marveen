@@ -71,7 +71,8 @@ Egy rövid visszaigazolás. Ha nem szólsz, nem tudja, hogy a döntése célba �
 Régen erre a POST `owner_approved_message_id` mezője szolgált: a sor rögtön `approved` lett. A
 közös tokennel ez ma 403, és sor sem jön létre, mert a szerver nem tudja ellenőrizni, hogy az üzenet
 tényleg a tulajdonostól jött-e, és vele bármely ágens jóváhagyottá tehetett egy kérést. A mezőt csak
-a tulajdonos saját bejelentkezése (vagy teljes jogú eszközkulcsa) fogadtatja el.
+a tulajdonos saját bejelentkezése fogadtatja el (eszközkulcs nem; a puszta token csak az első dashboard-login
+létrehozása előtt, ugyanaz a szabály, mint a hitelesítő adatok kiadásánál).
 
 Mit tegyél helyette: nyiss rendes (pending) kérést, és kérd meg a tulajdonost, hogy a dashboardon
 hagyja jóvá. Ugyanez áll az állandó címzett élesítésére (`email_standing_recipient` kategória) is.
