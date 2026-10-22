@@ -183,6 +183,8 @@ export function allowlistBashSegmentAllowed(seg) {
 //   bash-sandbox-write-paths.json  -- where a sandboxed agent may write (#2149)
 //   email-standing-recipients.json -- an address on it (once activated) takes letters with
 //                                     no per-letter approval (email-approval-gate.py)
+//   .approval-bot-token, .approval-bot-key -- the owner's approval bot and the key its button data is
+//                                     signed with (src/approval-bot.ts, #2160)
 // Their writers are the owner, the main agent and, for config-overrides.json, the dashboard
 // process; none of them runs this gate. Unlike the allowlist, these have no hash baseline yet,
 // so what this gate cannot see (a path built at runtime) is not reported after the fact.
@@ -192,11 +194,15 @@ export const PROTECTED_STORE_FILES = new Set([
   'config-overrides.json',
   'bash-sandbox-write-paths.json',
   'email-standing-recipients.json',
+  '.approval-bot-token',
+  '.approval-bot-key',
 ])
 // The file, or a glob that starts on its name. The prefixes are long enough that this gate's
-// and the features' own sources (bash-sandbox.ts, config-registry.ts) stay out of it.
+// and the features' own sources (bash-sandbox.ts, config-registry.ts) stay out of it; the
+// approval-bot files need their leading dot, so a source or doc named approval-bot-key-*.md or a
+// glob over src/approval-bot* stays out too.
 const PROTECTED_MENTION_RX =
-  /(?:egress[-_]?vendor[-_]?hosts|config[-_]?overrides|bash[-_]?sandbox[-_]?write[-_]?paths|email[-_]?standing[-_]?recipients)\.json|(?:egress[-_]?vendor|config[-_]?overrid|bash[-_]?sandbox[-_]?write|email[-_]?standing)[\w.-]*[*?[]/i
+  /(?:egress[-_]?vendor[-_]?hosts|config[-_]?overrides|bash[-_]?sandbox[-_]?write[-_]?paths|email[-_]?standing[-_]?recipients)\.json|\.approval[-_]?bot[-_]?(?:token|key)\b|(?:egress[-_]?vendor|config[-_]?overrid|bash[-_]?sandbox[-_]?write|email[-_]?standing|\.approval[-_]?bot)[\w.-]*[*?[]/i
 
 // One rule for every protected store object: a segment that mentions it may only be a plain
 // READ, and no output redirect in it may point at it (or at a target built at runtime).
@@ -1762,8 +1768,9 @@ const ALLOWLIST_GATE_MSG =
 
 const PROTECTED_STORE_GATE_MSG =
   'Vedett store-fajl TILTOTT (governance hard-gate). Sub-agentkent NEM irhatod a ' +
-  'store/egress-vendor-hosts.json, store/config-overrides.json, store/bash-sandbox-write-paths.json ' +
-  'es store/email-standing-recipients.json fajlt: mindegyik RAD vonatkozo kapu beallitasa. ' +
+  'store/egress-vendor-hosts.json, store/config-overrides.json, store/bash-sandbox-write-paths.json, ' +
+  'store/email-standing-recipients.json, store/.approval-bot-token es store/.approval-bot-key ' +
+  'fajlt: mindegyik RAD vonatkozo kapu beallitasa. ' +
   'Ha valtoztatas kell, kerd a fo agenst (inter-agent uzenet: mit es miert); o a gazda ' +
   'jovahagyasaval irja. Olvasni szabad: cat / grep / jq a fajlra (ertelmezo -- python, node -- nem).'
 

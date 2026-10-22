@@ -4,6 +4,7 @@
 //   config-overrides.json         -- dashboard settings, BASH_SANDBOX_AGENTS among them
 //   bash-sandbox-write-paths.json -- where a sandboxed agent may write (#2149)
 //   email-standing-recipients.json -- addresses a letter may go to without an approval
+//   .approval-bot-token, .approval-bot-key -- the owner's approval bot and its signing key (#2160)
 // Their legitimate writers are the owner and the main agent (and the dashboard process for
 // config-overrides.json); none of them runs this gate.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
@@ -14,7 +15,8 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 
-const FILES = ['egress-vendor-hosts.json', 'config-overrides.json', 'bash-sandbox-write-paths.json', 'email-standing-recipients.json']
+const FILES = ['egress-vendor-hosts.json', 'config-overrides.json', 'bash-sandbox-write-paths.json', 'email-standing-recipients.json',
+  '.approval-bot-token', '.approval-bot-key']
 
 let root: string
 let store: string
@@ -30,7 +32,7 @@ const decide = (tool: string, input: Record<string, unknown>) =>
   gateDecision(tool, input, { storeDir: store, allowlistPath: join(store, 'egress-allowlist.json'), cwd: root })
 const DENY = { deny: true, reason: 'protected-store-file' }
 
-it('the protected list is exactly the four files of the card', () => {
+it('the protected list is exactly the files of the card (four, and the approval bot\'s two)', () => {
   expect([...PROTECTED_STORE_FILES].sort()).toEqual([...FILES].sort())
 })
 
@@ -86,6 +88,7 @@ describe('Bash is fail-closed on the protected files', () => {
     'cp /tmp/x store/config-overrides.*',
     'cp /tmp/x store/bash-sandbox-write*',
     'cp /tmp/x store/email-standing*',
+    'cp /tmp/x store/.approval-bot*',
   ])('a glob that starts on the name is denied: %s', (command) => {
     expect(decide('Bash', { command })).toEqual(DENY)
   })
@@ -115,6 +118,12 @@ describe('Bash is fail-closed on the protected files', () => {
     'python3 scripts/__tests__/email-approval-gate.test.py',
     'bash scripts/__tests__/install-tz.test.sh',
     'ls src/web/bash-sandbox*',
+    // the approval bot's own source and test are not its token
+    'git add src/approval-bot.ts src/__tests__/approval-bot.test.ts',
+    // without the leading dot these would read as the token/key file (a doc name, a glob on the sources)
+    'git add docs/approval-bot-key-rotation.md',
+    'git add src/approval-bot* src/__tests__/approval-bot*',
+    'npx vitest run src/__tests__/approval-bot.test.ts',
     // a glob on the feature's sources is not a glob on the store file (a writer, so it would be denied)
     'git add src/web/bash-sandbox* src/__tests__/bash-sandbox*',
     'cp a.json b.json',
