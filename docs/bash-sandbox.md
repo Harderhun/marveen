@@ -21,6 +21,13 @@ Minden más hoszt kérdés nélkül tiltva van, nyers sockettel és proxy-megker
 
 1. Beállítások: `BASH_SANDBOX_AGENTS = soma` (vesszővel vagy szóközzel több ágens is megadható).
    Alapból üres, vagyis senki nincs sandboxban. A fő ágensre nem hat.
+   - Ágenst felvenni bármely hívó tud.
+   - LEVENNI csak bejelentkezett gazda-session vagy teljes jogú eszközkulcs tud, a közös tokennel nem
+     (403). A sandboxolt ágens ugyanis a localhoston eléri a dashboardot, és ugyanazt a tokent
+     birtokolja, amit a gazda UI-ja is használ; a tokenről nem dönthető el, ki a hívó. Dashboard-login
+     nélküli telepítésen a levétel útja a `store/config-overrides.json` kézi szerkesztése.
+   - A szabály a registry `loosens` mezője: minden olyan beállítás megkaphatja, amelynek egy változása
+     egy biztonsági kontrollt lazít.
 2. Ha az ágensnek a saját mappáján és a `~/worktrees/<azonosító>` mappán kívül is írnia kell,
    a gazda felveszi a helyet a `store/bash-sandbox-write-paths.json` fájlba:
    ```json
@@ -88,12 +95,24 @@ Törzs: `{"agent": "soma", "html_path": "/abs/riport.html", "pdf_path": "/abs/ri
   - az ágensnek szerepelnie kell a `BASH_SANDBOX_AGENTS`-en;
   - a HTML-t és a PDF-et csak az ágens sandbox-írási gyökerei alatt olvassa, illetve írja, realpath-szal,
     így symlinkkel sem lehet kijutni;
-  - a meglévő symlinket vagy könyvtárat nem írja felül.
+  - a meglévő symlinket vagy könyvtárat nem írja felül, és a PDF célkönyvtárát a beírás előtt újra
+    ellenőrzi (mérve: egy renderelés közben symlinkre cserélt könyvtárba nem ír).
+- A HTML-t egyszer, a memóriába olvassa be. A Chrome egy egy-dokumentumos 127.0.0.1-es originről kapja,
+  minden más útvonal 404, NEM fájlként.
+  - Fájlként megnyitva egy `file://` oldal más helyi fájlokat is a PDF-be húzhatna (`<iframe>`/`<object>`),
+    olyat is, amelynek olvasását az ágensnek tiltja egy Read-szabály. Http-originről a Chrome `file://`-t
+    nem tölt be.
+  - Mérve (`pdftotext`): egy kívül lévő titok-fájl szövege az új úton nem kerül a PDF-be, fájlként
+    renderelve viszont igen. Ez a kontroll.
+  - Az önálló riport (`data:` képek és betűk, ahogy Soma renderelője írja) változatlanul működik. A
+    relatív `src`/`href`-et a végpont nem szolgálja ki.
 - Korlátok: törzs legfeljebb 8 KB, HTML legfeljebb 10 MB, PDF legfeljebb 50 MB, 90 s, egyszerre
   legfeljebb két renderelés (a többi 429).
 - A Chrome fix argv-vel, shell nélkül, eldobható profillal fut, és hálózata nincs:
-  - minden kérés egy halott proxyra megy (127.0.0.1:9, a loopbackkel együtt);
-  - minden hosztnév NOTFOUND-ra oldódik fel;
+  - minden kérés egy halott proxyra megy (127.0.0.1:9, a loopbackkel együtt), kivéve a dokumentum
+    saját originjét;
+  - minden más hosztnév NOTFOUND-ra oldódik fel (a 127.0.0.1-et ki kell venni, különben a szabály a
+    dokumentumot sem engedi betölteni);
   - a nem proxyzott WebRTC UDP tiltva van.
   - Mérve: egy oldal, amelynek képe, stíluslapja és szkriptje is egy helyi figyelő szerverre mutat,
     semmit nem ér el. Ugyanez az oldal a kapcsolók nélkül eléri a szervert.

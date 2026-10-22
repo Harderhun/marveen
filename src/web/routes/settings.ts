@@ -7,6 +7,14 @@ import { setStoreWriteActor } from '../../store-watcher.js'
 import { syncRotationHeartbeatTask } from '../claude-rotation-heartbeat.js'
 import type { RouteContext } from './types.js'
 
+// A change the registry marks as loosening a security control (SettingDefinition.loosens) needs an
+// owner credential: a dashboard session or a full-scope device key. The shared fleet token is held
+// by every agent, so it cannot be told apart from the agent the control constrains.
+function ownerCredential(ctx: RouteContext): boolean {
+  return ctx.auth?.kind === 'session' || (ctx.auth?.kind === 'device' && ctx.auth.scope !== 'operator')
+}
+const LOOSEN_FORBIDDEN = 'This change loosens a security control: it needs an owner session or a full-scope device key, not the shared token'
+
 export async function tryHandleSettings(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method } = ctx
 
@@ -68,6 +76,11 @@ export async function tryHandleSettings(ctx: RouteContext): Promise<boolean> {
         return true
       }
 
+      if (def.loosens?.(String(getEffectiveSettingValue(key)), String(validation.value)) && !ownerCredential(ctx)) {
+        json(res, { error: LOOSEN_FORBIDDEN }, 403)
+        return true
+      }
+
       const resolvedActor = typeof actor === 'string' && actor ? actor : 'dashboard'
       setStoreWriteActor(resolvedActor)
       const oldValue = getEffectiveSettingValue(key)
@@ -121,6 +134,10 @@ export async function tryHandleSettings(ctx: RouteContext): Promise<boolean> {
         // A DELETE usually has no body; an unreadable one just keeps the default actor.
       }
 
+      if (def.loosens?.(String(getEffectiveSettingValue(key)), String(getSettingFallback(key).value)) && !ownerCredential(ctx)) {
+        json(res, { error: LOOSEN_FORBIDDEN }, 403)
+        return true
+      }
       setStoreWriteActor(actor)
       const oldValue = getEffectiveSettingValue(key)
       const result = clearOverride(key)

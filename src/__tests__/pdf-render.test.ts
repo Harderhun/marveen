@@ -3,7 +3,8 @@
 // listening server must not reach it with the lockdown flags, and the same page without them must
 // (the control that shows the test can fail).
 import { describe, it, expect, vi, afterAll } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync, readFileSync, renameSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import http from 'node:http'
@@ -18,7 +19,7 @@ const settings: Record<string, string> = {}
 vi.mock('../settings-store.js', () => ({ getEffectiveSettingValue: (k: string) => settings[k] ?? '' }))
 vi.mock('../web/agent-config.js', () => ({ agentDir: (n: string) => join(tmpRoot, 'agents', n) }))
 
-const { resolveRenderPaths, renderPdf, DEFAULT_CHROME_PATH } = await import('../web/pdf-render.js')
+const { resolveRenderPaths, renderHtmlToPdf, runChromePdf, networkLockdownArgs, writeRenderedPdf, DEFAULT_CHROME_PATH } = await import('../web/pdf-render.js')
 const { tryHandlePdfRender } = await import('../web/routes/pdf-render.js')
 
 const root = join(tmpRoot, 'agents', 'soma')
@@ -55,8 +56,18 @@ describe('resolveRenderPaths', () => {
   })
 })
 
+describe('writeRenderedPdf checks the destination again', () => {
+  it('a directory swapped for a link to outside while Chrome ran is refused', () => {
+    const d = join(root, 'swap'); mkdirSync(d)
+    expect(resolveRenderPaths([root], page, join(d, 'r.pdf'))).toMatchObject({ pdf: expect.any(String) })
+    renameSync(d, join(root, 'swap-old')); symlinkSync(outside, d)
+    expect(writeRenderedPdf([root], join(d, 'r.pdf'), Buffer.from('%PDF-x'))).toEqual({ ok: false, error: expect.stringMatching(/outside/) })
+    expect(existsSync(join(outside, 'r.pdf'))).toBe(false)
+  })
+})
+
 const hasChrome = existsSync(DEFAULT_CHROME_PATH)
-describe.skipIf(!hasChrome)('renderPdf with the real Chrome', () => {
+describe.skipIf(!hasChrome)('renderHtmlToPdf with the real Chrome', () => {
   async function withServer(fn: (port: number, hits: string[]) => Promise<void>): Promise<void> {
     const hits: string[] = []
     const srv = http.createServer((req, res) => { hits.push(req.url ?? ''); res.end('x') })
@@ -70,16 +81,28 @@ describe.skipIf(!hasChrome)('renderPdf with the real Chrome', () => {
 
   it('renders the PDF and the page reaches nothing; without the lockdown the same page does (control)', async () => {
     await withServer(async (port, hits) => {
-      const html = join(root, 'out', 'net.html'); writeFileSync(html, probePage(port))
-      const pdf = join(root, 'out', 'net.pdf')
-      const r = await renderPdf(html, pdf)
+      const r = await renderHtmlToPdf(Buffer.from(probePage(port)))
       expect(r).toMatchObject({ ok: true })
-      expect(readFileSync(pdf).subarray(0, 5).toString()).toBe('%PDF-')
+      if (r.ok) expect(r.pdf.subarray(0, 5).toString()).toBe('%PDF-')
       expect(hits).toEqual([])
-      const c = await renderPdf(html, join(root, 'out', 'control.pdf'), { lockdown: false })
+      const c = await renderHtmlToPdf(Buffer.from(probePage(port)), { lockdown: false })
       expect(c).toMatchObject({ ok: true })
       expect(hits.length).toBeGreaterThan(0)
     })
+  }, 120_000)
+
+  const hasPdftotext = (() => { try { execFileSync('pdftotext', ['-v'], { stdio: 'ignore' }); return true } catch { return false } })()
+  it.skipIf(!hasPdftotext)('a local file the page names never reaches the PDF; opened as file:// it does (control)', async () => {
+    const secret = join(outside, 'secret.txt'); writeFileSync(secret, 'TITKOS-NEO-7731\n')
+    const page2 = `<!doctype html><meta charset="utf-8"><h1>Riport</h1><iframe src="file://${secret}" width="600" height="80"></iframe><object data="file://${secret}" type="text/plain" width="600" height="80"></object>`
+    const text = (pdf: Buffer) => { const f = join(tmpRoot, `t-${Date.now()}.pdf`); writeFileSync(f, pdf); return execFileSync('pdftotext', [f, '-'], { encoding: 'utf-8' }) }
+    const r = await renderHtmlToPdf(Buffer.from(page2))
+    expect(r).toMatchObject({ ok: true })
+    if (r.ok) { expect(text(r.pdf)).toContain('Riport'); expect(text(r.pdf)).not.toContain('TITKOS-NEO-7731') }
+    const asFile = join(root, 'out', 'leak.html'); writeFileSync(asFile, page2)
+    const c = await runChromePdf(asFile, networkLockdownArgs(null))
+    expect(c).toMatchObject({ ok: true })
+    if (c.ok) expect(text(c.pdf)).toContain('TITKOS-NEO-7731')
   }, 120_000)
 })
 
