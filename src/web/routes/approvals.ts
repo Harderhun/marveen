@@ -15,6 +15,7 @@ import { resolveOwnerChatId } from '../../owner-chat.js'
 import { sendOwnerMessage } from '../../notify.js'
 import { sendTelegramMessage } from '../telegram.js'
 import { mayIssueCredentials, OWNER_SESSION_REQUIRED } from './auth.js'
+import { activeApprovalBot, sendApprovalPrompt } from '../../approval-bot.js'
 import type { RouteContext } from './types.js'
 
 // Kanban 80d0e3c6: APPROVING is the owner's decision, so the two routes that make a row approved
@@ -204,6 +205,23 @@ function notifyOwner(approval: Approval, chatApprovedMessageId: number | string 
     ? buildOwnerChatApprovedText(approval, chatApprovedMessageId)
     : buildOwnerApprovalText(approval)
   void (async () => {
+    // 80d0e3c6: with the approval bot on, the question goes out through it, with buttons whose press this
+    // server receives (src/approval-bot.ts). If it cannot send (no owner chat, the owner never pressed
+    // /start on that bot, Telegram down), the main-bot path below runs as if the bot were off.
+    if (!informative) {
+      const bot = activeApprovalBot()
+      if (bot) {
+        try {
+          if (await sendApprovalPrompt(bot, approval)) {
+            logger.info({ approvalId: approval.id }, 'approval owner notification sent through the approval bot')
+            return
+          }
+          logger.warn({ approvalId: approval.id }, 'approval bot could not send the question: using the main bot')
+        } catch (err) {
+          logger.warn({ err, approvalId: approval.id }, 'approval bot send FAILED: using the main bot')
+        }
+      }
+    }
     // APPROVALVAK821 fixed this path so the request reaches the OWNER and not
     // only the main agent's queue -- but the fix went out Telegram-only, so on
     // any install that speaks another provider the old silence came straight
