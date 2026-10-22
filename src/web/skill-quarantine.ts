@@ -35,10 +35,12 @@
 //   - the fleet import, the agent-bundle import and the `skill` CLI, which
 //     have their own paths;
 //   - editing a LIVE skill's SKILL.md through PUT /api/skills/:name;
-//   - who approves: the approve route accepts the same credentials as every
-//     other dashboard write. With the one shared dashboard token an agent can
-//     call it too; "only a human approves" needs the per-agent identity
-//     decision (#1985) first.
+//   - who approves: since kanban 2c72e07c the approve and reject routes take
+//     only an owner credential (a dashboard login session or a full-scope
+//     device key), not the shared dashboard token every agent holds. That makes
+//     "only a human approves" hold as far as the dashboard can tell a human
+//     apart; an agent able to read a device key or hijack the owner's browser
+//     session is outside it (per-agent identity, #1985).
 
 import { createHash, randomBytes } from 'node:crypto'
 import { execFileSync } from 'node:child_process'

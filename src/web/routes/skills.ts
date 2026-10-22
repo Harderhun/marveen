@@ -16,6 +16,7 @@ import { parseMultipart } from '../multipart.js'
 import { readBody, json } from '../http-helpers.js'
 import { sanitizeSkillName, shellEscape } from '../sanitize.js'
 import type { RouteContext } from './types.js'
+import { isOwnerCredential } from '../owner-credential.js'
 
 function parseFrontmatterField(content: string, field: string): string {
   const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/)
@@ -265,6 +266,15 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
   }
   const pendingActionMatch = path.match(/^\/api\/skills\/pending\/([^/]+)\/(approve|reject)$/)
   if (pendingActionMatch && method === 'POST') {
+    // The decision on a quarantined skill is the owner's: a session or a full-scope device key,
+    // never the shared token every agent holds (an agent could otherwise put its own quarantined
+    // skill live, fleet-wide). Reject is held to the same bar, so an agent cannot discard what is
+    // waiting for the owner's review either.
+    if (!isOwnerCredential(ctx.auth)) {
+      logger.warn({ id: pendingActionMatch[1], action: pendingActionMatch[2], auth: ctx.auth?.kind, agent: ctx.auth?.agent }, 'Pending skill decision refused: not an owner credential')
+      json(res, { error: 'Approving or rejecting a pending skill needs the owner: a dashboard login session or a full-scope device key, not the shared token. Log in, and remove the saved access token from this browser if one is stored.' }, 403)
+      return true
+    }
     const id = decodeURIComponent(pendingActionMatch[1])
     if (pendingActionMatch[2] === 'reject') {
       let ok = false

@@ -11864,7 +11864,7 @@ function renderPendingSkills(box, list) {
       reject.disabled = true
       try {
         const res = await fetch(`/api/skills/pending/${encodeURIComponent(p.id)}/reject`, { method: 'POST' })
-        if (!res.ok) throw new Error(String(res.status))
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || String(res.status))
         showToast(t('skills.pending.rejected', { name: p.name }))
       } catch (err) {
         showToast(`${t('skills.pending.error')}: ${err.message}`)

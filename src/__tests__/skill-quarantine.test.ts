@@ -65,7 +65,9 @@ function ctxFor(path: string, method: string, body?: Buffer, contentType?: strin
     destroy() {},
   }
   const url = new URL(`http://localhost:3420${path}`)
-  return { ctx: { req, res, path: url.pathname, method, url, auth: { kind: 'token' } } as RouteContext, out }
+  // The owner's browser session: approve/reject accept only an owner credential (2c72e07c); the
+  // shared-token caller is pinned in skill-approve-owner-only.test.ts.
+  return { ctx: { req, res, path: url.pathname, method, url, auth: { kind: 'session', user: 'owner' } } as RouteContext, out }
 }
 
 async function call(path: string, method: string, json?: object): Promise<Out> {
