@@ -120,6 +120,11 @@ describe('the launch paths carry the file', () => {
     expect(src).toMatch(/\$\{worksourceFlags\}\$\{bashSandboxFlag\}`\.trimEnd\(\)/)
     expect(src).toMatch(/bashSandboxFlag = ` --settings \$\{shSingleQuote\(sandboxFile\)\}`/)
     const block = src.slice(src.indexOf('let bashSandboxFlag'), src.indexOf("bash-sandbox: agent NOT started (fail-closed"))
+    // The switch itself (Szotasz, #2149 review): the file the flag names must come from the sync call
+    // for THIS agent, and the flag must be set from it. Without this pin, replacing the call with null
+    // left every other test green and the agent started unsandboxed.
+    expect(block).toMatch(/const sandboxFile = syncBashSandboxSettings\(name\)\n\s*if \(sandboxFile\) \{[\s\S]*?bashSandboxFlag = ` --settings \$\{shSingleQuote\(sandboxFile\)\}`/)
+    expect(block.match(/sandboxFile =/g)).toHaveLength(1)
     expect(block).toMatch(/if \(sandboxFile\) \{\s*if \(remote\.host && remote\.workdir\) \{\s*logger\.error\([^\n]*\n\s*return \{ ok: false, error: 'bash-sandbox: a remote agent cannot be sandboxed/)
     // a failure to write the file refuses the start, it does not start the agent unsandboxed
     expect(src).toMatch(/could not be written\)'\)\s*\n\s*return \{ ok: false, error: `bash-sandbox: /)

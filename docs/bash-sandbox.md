@@ -22,10 +22,12 @@ Minden más hoszt kérdés nélkül tiltva van, nyers sockettel és proxy-megker
 1. Beállítások: `BASH_SANDBOX_AGENTS = soma` (vesszővel vagy szóközzel több ágens is megadható).
    Alapból üres, vagyis senki nincs sandboxban. A fő ágensre nem hat.
    - Ágenst felvenni bármely hívó tud.
-   - LEVENNI csak bejelentkezett gazda-session vagy teljes jogú eszközkulcs tud, a közös tokennel nem
-     (403). A sandboxolt ágens ugyanis a localhoston eléri a dashboardot, és ugyanazt a tokent
-     birtokolja, amit a gazda UI-ja is használ; a tokenről nem dönthető el, ki a hívó. Dashboard-login
-     nélküli telepítésen a levétel útja a `store/config-overrides.json` kézi szerkesztése.
+   - LEVENNI csak a gazda tud: ugyanaz a szabály, mint a hitelesítő adatok kiadásánál
+     (`mayIssueCredentials`, #2163). A bejelentkezett gazda-session (akkor is, ha a böngésző mellette a
+     tárolt tokent is küldi) igen; a közös token egymagában nem (403), eszközkulcs sem. A sandboxolt
+     ágens ugyanis a localhoston eléri a dashboardot, és ugyanazt a tokent birtokolja, amit a gazda
+     UI-ja is használ; a tokenről nem dönthető el, ki a hívó. Dashboard-login nélküli telepítésen
+     (még nincs egyetlen felhasználó sem) a token a levételt is megteheti, ugyanúgy, mint a kiadást.
    - A szabály a registry `loosens` mezője: minden olyan beállítás megkaphatja, amelynek egy változása
      egy biztonsági kontrollt lazít.
 2. Ha az ágensnek a saját mappáján és a `~/worktrees/<azonosító>` mappán kívül is írnia kell,
@@ -55,6 +57,16 @@ az ágens nem indul el. A `sandbox.failIfUnavailable` miatt a Claude Code is kil
 
 - **Hookok és MCP-szerverek**: a sandboxon kívül futnak, és a hálózatuk szabad (mérve: mindkettőből
   example.com HTTP 200).
+- **Az ügynök a következő indítására sandbox nélküli hálózati utat telepíthet magának (korlát, élőben
+  NEM mérve; kódolvasással igazolva).** A sandbox `allowWrite`-ja tartalmazza az ügynök saját mappáját
+  (`agents/<név>`), és ott van a projekt-szintű `.mcp.json` és a `.claude/settings.json` a hookokkal.
+  Ezeket a Claude Code a sandboxon KÍVÜL, hálózattal futtatja (lásd az előző pontot), és a
+  `writeAgentSettingsFromProfile` minden indításkor a meglévő `settings.json`-ra épít: a saját
+  kapu-bejegyzéseit cseréli, az idegen `PreToolUse`-bejegyzéseket megtartja. Egy listás ügynök tehát a
+  sandboxolt Bash-ével beírhat egy MCP-szervert vagy egy hookot, ami a következő újraindítástól sandbox
+  nélkül, hálózattal fut. Javasolt külön lépés (nem ebben a változásban): a `.mcp.json` és a
+  `.claude/` kikerül az `allowWrite`-ból (a Seatbelt-profilban írástiltásként), vagy a
+  `writeAgentSettingsFromProfile` az ismeretlen hookokat eldobja.
 - **Write/Edit tool**: nem sandboxolt.
   - A generált fájlokat a `store/bash-sandbox` 0555-ös könyvtár (és a 0444-es fájlok) védi. Ebben a
     Write és az Edit is EACCES-szel bukik (mérve), mert ideiglenes fájlon át írnak. Egy önmagában
