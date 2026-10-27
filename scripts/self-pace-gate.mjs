@@ -270,6 +270,8 @@ export function fileToolTargetsAllowlist(toolInput, allowlistPath = DEFAULT_ALLO
 //   - A $(...) or backtick substitution that assigns a scheduler result
 //     (`X=$(crontab -)`, `X=`crontab -``) is caught by SCHEDULER_RX's boundary
 //     anchor, which now includes both `(` and the backtick.
+//   - Code piped into a shell (`echo ... | sh`) is not decided.
+//   - Code run by another interpreter (`python3 -c`, `node -e`) is not decided.
 export function splitSegments(command) {
   return String(command ?? '')
     .replace(/\\\r?\n/g, ' ')
@@ -1680,6 +1682,404 @@ export function gateDecision(toolName, toolInput, opts = {}) {
   }
 }
 
+// Small word splitter for the shell-code and tmux checks (shellWords/readWord
+// stay as they are, other checks depend on them). Returns [{ value, ansi }] or
+// null on an unterminated quote. $(...), backticks and ${...} stay plain text in
+// the word: they are tracked only so a space inside one does not split the word.
+// Unquoted ( and ) end a word and are dropped. Unquoted < and > end a word and
+// start a redirection operator, emitted as its own word with redirect: true; the
+// word after it is its target (target: true). A word with an unquoted bash brace
+// expansion (`{a,b}`, `{1..3}`) gets brace: true.
+function splitCodeWords(text) {
+  const words = []
+  let cur = null
+  let i = 0
+  let expectTarget = false
+  let braceOpen = false
+  let braceSep = false
+  const add = (s, ansi) => {
+    if (cur == null) {
+      cur = { value: '', ansi: false }
+      braceOpen = false
+      braceSep = false
+      if (expectTarget) {
+        cur.target = true
+        expectTarget = false
+      }
+    }
+    cur.value += s
+    if (ansi) cur.ansi = true
+  }
+  let depth = 0
+  let tick = false
+  while (i < text.length) {
+    const c = text[i]
+    if (depth === 0 && !tick && (c === ' ' || c === '\t')) {
+      if (cur) words.push(cur)
+      cur = null
+      i++
+    } else if (c === '#' && cur == null && depth === 0 && !tick) {
+      // an unquoted # at a word start comments out the rest of the line, so an
+      // apostrophe there (`# don't`) is not an unterminated quote
+      const nl = text.indexOf('\n', i)
+      i = nl < 0 ? text.length : nl
+    } else if (c === "'") {
+      const end = text.indexOf("'", i + 1)
+      if (end < 0) return null
+      add(text.slice(i + 1, end))
+      i = end + 1
+    } else if (c === '"') {
+      let j = i + 1
+      let s = ''
+      for (;;) {
+        if (j >= text.length) return null
+        if (text[j] === '"') break
+        if (text[j] === '\\' && '"\\$`'.includes(text[j + 1] ?? '')) j++
+        s += text[j]
+        j++
+      }
+      add(s)
+      i = j + 1
+    } else if (c === '$' && text[i + 1] === "'") {
+      let j = i + 2
+      for (;;) {
+        if (j >= text.length) return null
+        if (text[j] === '\\') j++
+        else if (text[j] === "'") break
+        j++
+      }
+      add(text.slice(i, j + 1), true)
+      i = j + 1
+    } else if (c === '\\') {
+      if (i + 1 < text.length) add(text[i + 1])
+      i += 2
+    } else if (depth === 0 && !tick && (c === '(' || c === ')')) {
+      if (cur) words.push(cur)
+      cur = null
+      i++
+    } else if (depth === 0 && !tick && (c === '<' || c === '>')) {
+      let prefix = ''
+      if (cur && (cur.value === '' || /^\d+$/.test(cur.value) || cur.value === '&')) {
+        prefix = cur.value
+        cur = null
+      } else if (cur) {
+        words.push(cur)
+        cur = null
+      }
+      let j = i
+      while (j < text.length && '<>&|-'.includes(text[j])) j++
+      words.push({ value: prefix + text.slice(i, j), ansi: false, redirect: true })
+      expectTarget = true
+      i = j
+    } else {
+      if (c === '`') tick = !tick
+      else if (c === '$' && (text[i + 1] === '(' || text[i + 1] === '{')) {
+        depth++
+        add(c + text[i + 1])
+        i += 2
+        continue
+      } else if (depth > 0 && (c === ')' || c === '}')) depth--
+      add(c)
+      if (depth === 0 && !tick) {
+        if (c === '{') {
+          braceOpen = true
+          braceSep = false
+        } else if (braceOpen && (c === ',' || (c === '.' && text[i + 1] === '.'))) braceSep = true
+        else if (c === '}' && braceOpen && braceSep) cur.brace = true
+      }
+      i++
+    }
+  }
+  if (cur) words.push(cur)
+  return words
+}
+
+const SHELL_NAMES = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'mksh', 'rbash', 'yash', 'posh'])
+const baseName = (v) => v.slice(v.lastIndexOf('/') + 1)
+
+// The words without redirection operators and their targets: the command's
+// own arguments.
+const argWords = (words) => words.filter((w) => !w.redirect && !w.target)
+
+// tmux global options: flags (combinable) and options taking a value (attached
+// or as the next word). Returns { next, codes } where next is the index of the
+// tmux command word and codes the words given to -c.
+function tmuxGlobalOptions(words, from) {
+  const codes = []
+  let i = from
+  while (i < words.length) {
+    const v = words[i].value
+    if (!/^-[2CDlNuvVcfLST]/.test(v)) break
+    let consumedNext = false
+    for (let j = 1; j < v.length; j++) {
+      if ('2CDlNuvV'.includes(v[j])) continue
+      if (!'cfLST'.includes(v[j])) break
+      const attached = v.slice(j + 1)
+      let val = null
+      if (attached) val = { value: attached, ansi: words[i].ansi }
+      else if (words[i + 1]) {
+        val = words[i + 1]
+        consumedNext = true
+      }
+      if (v[j] === 'c' && val) codes.push(val)
+      break
+    }
+    i += consumedNext ? 2 : 1
+  }
+  return { next: i, codes }
+}
+
+// How many following words a shell option word takes as its values: one per o/O letter in a
+// short-option bundle (bash -oc pipefail 'code'), one for --rcfile/--init-file, else none.
+function optionValueCount(v) {
+  if (/^[-+][A-Za-z]+$/.test(v)) return (v.match(/[oO]/g) ?? []).length
+  if (v === '--rcfile' || v === '--init-file') return 1
+  return 0
+}
+
+// What one shell word in `words` (at index i) runs: { codes } the words given
+// as code strings (-c; for fish also -C, --command, --init-command), and
+// { stdin } when no code string is given, so the word may read its code from
+// stdin (whatever its operand is).
+function shellWordRuns(words, i) {
+  const fish = baseName(words[i].value) === 'fish'
+  const codes = []
+  let cGiven = false
+  let mainGiven = false
+  let operand = false
+  for (let j = i + 1; j < words.length; j++) {
+    const v = words[j].value
+    if (!/^[-+]/.test(v) || v === '--') {
+      // fish: a -c/-C/--command/--init-command anywhere still runs code
+      if (!fish) break
+      operand = true
+      continue
+    }
+    if (fish && /^-[^-]/.test(v) && /[cC]/.test(v.slice(1))) {
+      const k = v.slice(1).search(/[cC]/) + 1
+      const rest = v.slice(k + 1)
+      if (v[k] === 'c' && !operand) mainGiven = true
+      if (rest === '') {
+        if (words[j + 1]) codes.push(words[j + 1])
+        j++
+      } else {
+        codes.push({ value: rest, ansi: words[j].ansi })
+      }
+      continue
+    }
+    if (fish && (v === '--command' || v === '--init-command')) {
+      if (v === '--command' && !operand) mainGiven = true
+      if (words[j + 1]) codes.push(words[j + 1])
+      j++
+      continue
+    }
+    if (fish && (v.startsWith('--command=') || v.startsWith('--init-command='))) {
+      if (v.startsWith('--command=') && !operand) mainGiven = true
+      codes.push({ value: v.slice(v.indexOf('=') + 1), ansi: words[j].ansi })
+      continue
+    }
+    if (/^-[A-Za-z]+$/.test(v) && v.includes('c')) cGiven = true
+    j += optionValueCount(v)
+  }
+  if (!fish && cGiven) {
+    // the code string is the first non-option word after the options
+    let j = i + 1
+    for (; j < words.length; j++) {
+      const v = words[j].value
+      if (!/^[-+]/.test(v)) break
+      if (v === '--') { j++; break }
+      j += optionValueCount(v)
+    }
+    if (words[j]) codes.push(words[j])
+  }
+  return { codes, stdin: fish ? !mainGiven : !cGiven }
+}
+
+// shellSegments cuts at an escaped `\;` (tmux's own command separator); glue
+// such pieces back together so `tmux a \; send-keys` stays one segment.
+function codeSegments(command) {
+  const segs = shellSegments(command)
+  if (segs == null) {
+    const whole = String(command ?? '')
+    const out = [{ own: whole, bodies: [] }]
+    for (const piece of splitSegments(whole)) {
+      const own = piece.trim()
+      if (own) out.push({ own, bodies: [], naive: true })
+    }
+    return out
+  }
+  const out = []
+  for (const seg of segs) {
+    const prev = out[out.length - 1]
+    if (prev && prev.sep === ';' && /(?:^|[^\\])(?:\\\\)*\\$/.test(prev.own)) {
+      out[out.length - 1] = { ...seg, own: prev.own + '; ' + seg.own, bodies: [...prev.bodies, ...seg.bodies] }
+    } else out.push(seg)
+  }
+  return out
+}
+
+// Every piece of shell code the command hands to another shell as
+// { value, ansi }, plus `bad` when a segment holding a shell word, eval or tmux
+// could not be split (unterminated quote) or hides such a word behind $'..' or a
+// brace expansion.
+const HIDDEN_NAMES = new Set([...SHELL_NAMES, 'eval', 'trap', 'tmux', 'systemctl'])
+const CMD_WRAPPERS = new Set(['env', 'sudo', 'command', 'builtin', 'exec', 'nohup', 'nice', 'time', 'stdbuf', 'setsid', 'xargs'])
+const RESERVED_LEAD = new Set(['!', '{', 'if', 'then', 'elif', 'else', 'do', 'while', 'until'])
+// Index of the command word in a segment: the first word that is not a VAR=val
+// assignment, a wrapper or a reserved leading word; -1 if there is none.
+function commandWordIndex(args) {
+  return args.findIndex((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w.value) && !CMD_WRAPPERS.has(w.value) && !RESERVED_LEAD.has(w.value))
+}
+const EVAL_QUOTING_COMMANDS = new Set(['echo', 'printf', 'grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk', 'cat', 'jq', 'test', '[', 'man', 'which', 'type'])
+
+function scanShellCode(command) {
+  const segs = codeSegments(command)
+  const codes = []
+  const seen = new Set()
+  const push = (c) => {
+    const key = `${c.ansi ? 1 : 0}:${c.value}`
+    if (seen.has(key)) return
+    seen.add(key)
+    codes.push(c)
+  }
+  let bad = false
+  for (const seg of segs) {
+    const words = splitCodeWords(seg.own)
+    const names = /\b(?:sh|bash|dash|zsh|ksh|ash|fish|csh|tcsh|mksh|rbash|yash|eval|trap|tmux|systemctl)\b/
+    if (words == null) {
+      // a naive piece can cut a quoted string in two; the whole command is scanned too
+      if (!seg.naive && names.test(seg.own)) bad = true
+      continue
+    }
+    const args = argWords(words)
+    const cmdIndex = commandWordIndex(args)
+    const cmdWord = cmdIndex >= 0 ? args[cmdIndex] : undefined
+    if (cmdWord && (cmdWord.ansi || cmdWord.brace)) bad = true
+    if (args.some((w) => HIDDEN_NAMES.has(baseName(w.value))) && words.some((w) => w.ansi || w.brace)) bad = true
+    let stdinBodies = null
+    const stdinCodes = () => {
+      if (stdinBodies == null) {
+        stdinBodies = (seg.bodies ?? []).map((b) => ({ value: b, ansi: false }))
+        for (let j = 0; j < words.length; j++) {
+          if (words[j].redirect && /^\d*<<<$/.test(words[j].value) && words[j + 1]?.target) stdinBodies.push(words[j + 1])
+        }
+      }
+      return stdinBodies
+    }
+    for (let i = 0; i < args.length; i++) {
+      const v = args[i].value
+      if (v === 'eval' && !(cmdWord && EVAL_QUOTING_COMMANDS.has(cmdWord.value))) {
+        const rest = args.slice(i + 1)
+        if (rest.length) push({ value: rest.map((w) => w.value).join(' '), ansi: rest.some((w) => w.ansi) })
+      }
+      if (v === 'trap') {
+        let t = i + 1
+        // option words end at `--`; a lone `-` is the action word
+        while (t < args.length && args[t].value.length > 1 && args[t].value.startsWith('-')) {
+          if (args[t++].value === '--') break
+        }
+        if (args[t]) push(args[t])
+      }
+      if (i === cmdIndex && (v === '.' || v === 'source') && args[i + 1]) {
+        for (const c of stdinCodes()) push(c)
+      }
+      const base = baseName(v)
+      if (base === 'tmux') for (const c of tmuxGlobalOptions(args, i + 1).codes) push(c)
+      if (!SHELL_NAMES.has(base)) continue
+      const runs = shellWordRuns(args, i)
+      for (const c of runs.codes) push(c)
+      if (!runs.stdin) continue
+      for (const c of stdinCodes()) push(c)
+    }
+  }
+  return { codes, bad }
+}
+
+export function shellCodeStrings(command) {
+  return scanShellCode(command).codes.map((c) => c.value)
+}
+
+// tmux takes an exact command name or alias first, otherwise a prefix that only
+// one command name starts with. Measured with tmux 3.6 `list-commands`, the
+// words that reach a pane-injecting command are:
+//   send-keys:    send send-k send-ke send-key send-keys
+//   run-shell:    ru run run- run-s run-sh run-she run-shel run-shell
+//   paste-buffer: pa pas past paste paste- pasteb paste-b paste-bu paste-buf paste-buff paste-buffe paste-buffer
+//   set-buffer:   setb set-b set-bu set-buf set-buff set-buffe set-buffer
+const TMUX_PANE_INJECT_WORDS = new Set([
+  'send', 'send-k', 'send-ke', 'send-key', 'send-keys',
+  'ru', 'run', 'run-', 'run-s', 'run-sh', 'run-she', 'run-shel', 'run-shell',
+  'pa', 'pas', 'past', 'paste', 'paste-', 'pasteb', 'paste-b', 'paste-bu', 'paste-buf', 'paste-buff', 'paste-buffe', 'paste-buffer',
+  'setb', 'set-b', 'set-bu', 'set-buf', 'set-buff', 'set-buffe', 'set-buffer',
+])
+
+// A .timer or .path unit runs its service later or on a file change, so
+// starting, enabling or linking one is a self-timed future run, the same thing
+// SCHEDULER_RX denies for systemd-run.
+const SYSTEMCTL_ARM_VERBS = new Set([
+  'start', 'restart', 'try-restart', 'reload-or-restart', 'try-reload-or-restart',
+  'condrestart', 'force-reload', 'enable', 'reenable', 'preset', 'link', 'edit',
+  'add-wants', 'add-requires', 'isolate',
+])
+
+const SYSTEMCTL_VERBS = new Set([
+  'start', 'stop', 'reload', 'restart', 'try-restart', 'reload-or-restart', 'try-reload-or-restart',
+  'condrestart', 'condreload', 'condstop', 'force-reload', 'isolate', 'kill', 'clean', 'freeze', 'thaw',
+  'set-property', 'bind', 'mount-image', 'service-log-level', 'service-log-target', 'reset-failed', 'whoami',
+  'list-units', 'list-automounts', 'list-paths', 'list-sockets', 'list-timers', 'is-active', 'is-failed',
+  'status', 'show', 'cat', 'help', 'list-dependencies', 'enable', 'disable', 'reenable', 'preset',
+  'preset-all', 'is-enabled', 'mask', 'unmask', 'link', 'revert', 'add-wants', 'add-requires', 'edit',
+  'get-default', 'set-default', 'list-unit-files', 'list-machines', 'list-jobs', 'cancel',
+  'show-environment', 'set-environment', 'unset-environment', 'import-environment', 'daemon-reload',
+  'daemon-reexec', 'log-level', 'log-target', 'service-watchdogs', 'default', 'rescue', 'emergency',
+  'halt', 'poweroff', 'reboot', 'kexec', 'soft-reboot', 'exit', 'switch-root', 'suspend', 'hibernate',
+  'hybrid-sleep', 'suspend-then-hibernate', 'sleep',
+])
+
+// words: output of splitCodeWords. The verb of `systemctl` is the first later
+// word that is a systemctl verb (what precedes it is options and their
+// values). True when that verb is an arm verb and a later word is a .timer or
+// .path unit, or a glob or brace (* ? [ {) that may expand to one: bash
+// expands `x.{timer,service}` and systemctl matches `x.*` against loaded
+// units. A non-arm verb arms nothing, even if `start x.timer` follows it as
+// unit names.
+const SYSTEMCTL_VALUE_OPTIONS = new Set([
+  '-o', '--output', '-t', '--type', '-p', '--property', '-P', '-M', '--machine', '-H', '--host', '-s', '--signal',
+  '-n', '--lines', '--root', '--image', '--image-policy', '--state', '--what', '--job-mode', '--kill-whom',
+  '--kill-value', '--timestamp', '--message', '--drop-in', '--when', '--boot-loader-entry', '--boot-loader-menu',
+  '--reboot-argument', '--check-inhibitors', '--preset-mode',
+])
+
+export function systemctlArmsTimer(words) {
+  words = argWords(words)
+  for (let i = 0; i < words.length; i++) {
+    if (baseName(words[i].value) !== 'systemctl') continue
+    let v = -1
+    for (let k = i + 1; k < words.length; k++) {
+      if (SYSTEMCTL_VERBS.has(words[k].value)) { v = k; break }
+      if (SYSTEMCTL_VALUE_OPTIONS.has(words[k].value)) k++
+    }
+    if (v < 0 || !SYSTEMCTL_ARM_VERBS.has(words[v].value)) continue
+    if (words.slice(v + 1).some((w) => w.value.endsWith('.timer') || w.value.endsWith('.path') || w.value.endsWith('.target') || w.brace || /[*?[]/.test(w.value))) return true
+  }
+  return false
+}
+
+// words: output of splitCodeWords. Follows `tmux [global options] cmd ... \; cmd`.
+export function tmuxInjectsPane(words) {
+  words = argWords(words)
+  for (let i = 0; i < words.length; i++) {
+    if (baseName(words[i].value) !== 'tmux') continue
+    let k = tmuxGlobalOptions(words, i + 1).next
+    if (words[k] && TMUX_PANE_INJECT_WORDS.has(words[k].value)) return true
+    for (; k < words.length; k++) {
+      const v = words[k].value
+      if ((v === ';' || v.endsWith(';')) && words[k + 1] && TMUX_PANE_INJECT_WORDS.has(words[k + 1].value)) return true
+    }
+  }
+  return false
+}
+
 function decide(toolName, toolInput, opts = {}) {
   const name = String(toolName ?? '')
   if (SELF_PACE_TOOLS.has(name)) return { deny: true }
@@ -1737,6 +2137,24 @@ function decide(toolName, toolInput, opts = {}) {
     for (const seg of (masked == null ? naiveSegs : splitSegments(masked))) {
       // scheduler binaries: deny the exec/submit forms, allow pure read-listing
       if (SCHEDULER_RX.test(seg) && !SCHEDULER_READ_RX.test(seg)) return { deny: true }
+    }
+    // Shell code handed to another shell (sh -c, eval, here-strings, heredocs,
+    // tmux -c) is decided recursively; quoted, it was blanked above. The RAW
+    // command is used: safeCommand blanks heredoc bodies and data payloads.
+    const rawCommand = String(toolInput?.command ?? '')
+    const depth = opts.depth ?? 0
+    const scan = scanShellCode(rawCommand)
+    for (const code of scan.codes) {
+      if (code.ansi) return { deny: true, reason: 'shell-code' }
+      if (depth >= 4) return { deny: true, reason: 'shell-code-depth' }
+      const inner = decide('Bash', { command: code.value }, { ...opts, depth: depth + 1 })
+      if (inner.deny) return { deny: true, reason: inner.reason ?? 'shell-code' }
+    }
+    if (scan.bad) return { deny: true, reason: 'shell-code' }
+    // tmux command shortcuts and `tmux a \; send-keys` chains
+    for (const seg of codeSegments(rawCommand)) {
+      const words = splitCodeWords(seg.own)
+      if (words != null && (tmuxInjectsPane(words) || systemctlArmsTimer(words))) return { deny: true }
     }
   }
   return { deny: false }
