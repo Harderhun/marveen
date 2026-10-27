@@ -260,6 +260,12 @@ export interface TaskInflightEntry {
   // run; the next sweep checks whether that item has left pending/ (progress:
   // the reader consumed the head, so our item's wait is backlog, not neglect).
   worksourcePendingHead?: string
+  // The sweep time at which the item was first seen in pending/ in its current
+  // stay there; cleared with worksourcePendingSince, but never restarted by
+  // queue progress. Only the alert texts read it ("N minutes in pending/"). A
+  // stretch with an unreadable stage (null) keeps it, as it keeps
+  // worksourcePendingSince: no signal either way.
+  worksourcePendingEnteredAt?: number
   // Set once the sweep has pressed its single recovery Enter for a prompt parked
   // in an overfull input box, so a second 'lost' verdict on this entry takes the
   // ordinary lost path instead of Enter-looping.
@@ -3206,6 +3212,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
       // made NO progress can ever span the grace window.
       if (entry.viaWorksource === true) {
         if (worksourceStage === 'pending') {
+          if (entry.worksourcePendingEnteredAt == null) entry.worksourcePendingEnteredAt = now
           if (entry.worksourcePendingSince == null) {
             entry.worksourcePendingSince = now
           } else if (entry.worksourcePendingHead != null) {
@@ -3218,6 +3225,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
         } else if (worksourceStage === 'active' || worksourceStage === 'done') {
           entry.worksourcePendingSince = undefined
           entry.worksourcePendingHead = undefined
+          entry.worksourcePendingEnteredAt = undefined
         }
       }
       const decision = decideTaskTimeout(entry, state, now, {
@@ -3235,6 +3243,12 @@ export function startScheduleRunner(): NodeJS.Timeout {
         isWorksourceItemStuckInPending(entry, worksourceStage, now, TASK_FIRE_GRACE_MS)
           ? 'worksource-pending'
           : undefined
+      // The pending wording counts the item's current stay in pending/, not the time since the injection (an item
+      // requeued after a long hand-over has stood there only since the requeue) and not the pending run the
+      // decisions time, which queue progress restarts.
+      const alertElapsedMs = pendingReason === 'worksource-pending' && entry.worksourcePendingEnteredAt != null
+        ? now - entry.worksourcePendingEnteredAt
+        : now - entry.injectedAt
       // PROMPTCSONK923: record what actually ARRIVED, from the transcript. On
       // a closing decision this is the last look, so a head-only arrival is
       // recorded as 'tail-lost' instead of waiting for a tail that is not
@@ -3296,10 +3310,10 @@ export function startScheduleRunner(): NodeJS.Timeout {
         }
         taskInflightMap.delete(key)
       } else if (decision === 'alert') {
-        sendTaskInflightMainAgentNotice(entry, now - entry.injectedAt, pendingReason)
+        sendTaskInflightMainAgentNotice(entry, alertElapsedMs, pendingReason)
         entry.alerted = true
       } else if (decision === 'escalate') {
-        sendTaskTimeoutAlert(entry, now - entry.injectedAt, pendingReason)
+        sendTaskTimeoutAlert(entry, alertElapsedMs, pendingReason)
         entry.ownerAlerted = true
       } else if (decision === 'lost' && !entry.parkedEnterSent && isOwnPromptParkedOverfull(pane, getInjectedPrompt(entry.session))) {
         // Not lost: our prompt is parked in a box taller than the pane, where
