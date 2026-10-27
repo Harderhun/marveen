@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 // @ts-expect-error -- plain .mjs hook script, no types
@@ -214,5 +214,108 @@ describe('sender scripts, review round 1 (SCRIPTSENDGATE1020)', () => {
     ]) {
       expect(bash(cmd, repo).deny, cmd).toBe(false)
     }
+  })
+})
+
+describe('Microsoft Graph sends in a script (MAILGATESCRIPT1027)', () => {
+  const GRAPH_SEND = "const id = process.argv[2]\nawait fetch('https://graph.microsoft.com/v1.0/me/messages/' + id + '/send', { method: 'POST' })\n"
+  const GRAPH_REPLY = "const u = 'x'\nawait fetch(`https://graph.microsoft.com/v1.0/users/${u}/messages/1/reply`, { method: 'POST' })\n"
+  const GRAPH_READ = "await fetch('https://graph.microsoft.com/v1.0/me/messages?top=5')\n"
+  const cwd = workdir({
+    'graph-send.mjs': GRAPH_SEND,
+    'graph-reply.ts': GRAPH_REPLY,
+    'graph-read.mjs': GRAPH_READ,
+    'harmless.mjs': "console.log('hello')\n",
+    'main.mjs': "import './lib.mjs'\nconsole.log('main')\n",
+    'lib.mjs': "await fetch('https://graph.microsoft.com/v1.0/me/sendMail', { method: 'POST' })\n",
+    'reexp.mjs': "export * from './transport2.mjs'\n",
+    'transport2.mjs': GRAPH_SEND,
+    'escaped.mjs': 'await fetch("https:\\/\\/graph.microsoft.com\\/v1.0\\/me\\/sendMail", { method: "POST" })\n',
+    'routes.mjs': "app.get('/me/messages/:id/reply', showReplyPage)\n",
+    'preview.mjs': "await fetch('https://graph.microsoft.com/v1.0/me/messages/1/send-preview')\n",
+    'real/main.mjs': "import './transport.mjs'\n",
+    'real/transport.mjs': GRAPH_SEND,
+    'link/.keep': '',
+    // MAILGATESCRIPT1027 R2: fixtures of the second-round review fixes
+    'r2real/main.mjs': [0, 1, 2, 3, 4].map((n) => `import './h${n}.mjs'`).join('\n') + '\n',
+    'r2real/h0.mjs': "const n = require('nodemailer')\n",
+    'r2real/h1.mjs': 'console.log(1)\n',
+    'r2real/h2.mjs': 'console.log(1)\n',
+    'r2real/h3.mjs': 'console.log(1)\n',
+    'r2real/h4.mjs': 'console.log(1)\n',
+    'r2link/.keep': '',
+    'r2types.ts': "export type { T } from './r2sender.mjs'\nimport type { U } from './r2sender.mjs'\nconsole.log(1)\n",
+    'r2sender.mjs': GRAPH_SEND,
+    'r2uni.mjs': "await fetch('https://graph.microsoft.com/v1.0/me/messages/1/reply\u00e9')\n",
+    'r2pkg/__init__.py': '',
+    'r2pkg/__main__.py': 'from . import mailer\n',
+    'r2pkg/mailer.py': 'import smtplib\n',
+    'r3esc.mjs': 'const u = "https://graph.microsoft.com/v1.0/me/sendMail\\"; await fetch(u)\n',
+    'r3sender.mjs': "import nodemailer from 'nodemailer'\nexport default 1\n",
+    'r3typedefault.mjs': "import type from './r3sender.mjs'\nvoid type\n",
+    'r3mailer.py': 'import smtplib\n',
+    'r3star.py': 'from r3mailer import *\n',
+  })
+  symlinkSync(join(cwd, 'real', 'main.mjs'), join(cwd, 'link', 'main.mjs'))
+  symlinkSync(join(cwd, 'r2real', 'main.mjs'), join(cwd, 'r2link', 'main.mjs'))
+
+  it('is a send for a node file, a .ts file and a file whose helper sends', () => {
+    for (const cmd of ['node graph-send.mjs AAMk1', 'tsx graph-reply.ts', 'node main.mjs']) {
+      expect(scriptRunSends(cmd, cwd), cmd).toBe(true)
+    }
+  })
+
+  it('is no send for a Graph read or a harmless file', () => {
+    for (const cmd of ['node graph-read.mjs', 'node harmless.mjs']) {
+      expect(scriptRunSends(cmd, cwd), cmd).toBe(false)
+    }
+  })
+
+  it('reads the script after bun run and npx tsx, and not after another npx package', () => {
+    expect(scriptRunSends('bun run graph-send.mjs', cwd)).toBe(true)
+    expect(scriptRunSends('npx tsx graph-send.mjs', cwd)).toBe(true)
+    expect(scriptRunSends('npx vitest run', cwd)).toBe(false)
+  })
+
+  it('follows an ESM re-export to the helper', () => {
+    expect(scriptRunSends('node reexp.mjs', cwd)).toBe(true)
+  })
+
+  it('sees a Graph URL with escaped slashes', () => {
+    expect(scriptRunSends('node escaped.mjs', cwd)).toBe(true)
+  })
+
+  it('is no send for an application route of the same shape or for send-preview', () => {
+    expect(scriptRunSends('node routes.mjs', cwd)).toBe(false)
+    expect(scriptRunSends('node preview.mjs', cwd)).toBe(false)
+  })
+
+  it('resolves helpers next to the real path of a symlinked entry', () => {
+    expect(scriptRunSends('node link/main.mjs', cwd)).toBe(true)
+  })
+
+  // MAILGATESCRIPT1027 R2
+  it('reads the real-path helpers of a symlinked entry with five imports', () => {
+    expect(scriptRunSends('node r2link/main.mjs', cwd)).toBe(true)
+  })
+
+  it('loads nothing for a type-only export or import', () => {
+    expect(scriptRunSends('tsx r2types.ts', cwd)).toBe(false)
+  })
+
+  it('ends no action word at a letter outside ASCII', () => {
+    expect(scriptRunSends('node r2uni.mjs', cwd)).toBe(false)
+    // MAILGATESCRIPT1027 R3: the forms the round-2 commit lost, and a value import named `type`
+    expect(scriptRunSends('node r3esc.mjs', cwd)).toBe(true)
+    expect(scriptRunSends('node r3typedefault.mjs', cwd)).toBe(true)
+    expect(scriptRunSends('python3 r3star.py', cwd)).toBe(true)
+  })
+
+  it('follows a package-relative python import', () => {
+    expect(scriptRunSends(`python3 ${cwd}/r2pkg/__main__.py`, cwd)).toBe(true)
+  })
+
+  it('is no script run for npx with another package, even with an address', () => {
+    expect(scriptRunSends('npx harmless-report --to qa@example.test', cwd)).toBe(false)
   })
 })
