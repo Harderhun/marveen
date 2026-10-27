@@ -150,8 +150,48 @@ def _graph_sends(text: str) -> bool:
     return bool(_GRAPH_SEND.search(t) and _GRAPH_EVIDENCE.search(t))
 
 
+# MAILGATEHTTPAPI1027: an HTTP mail API reached from a script (Marveen 50920: a Gmail REST send from
+# urllib went past the approval gate, because only SMTP, nodemailer and Graph were known). Each provider
+# needs its own evidence AND a send shape in the same text, so a Gmail read (messages list, profile) or a
+# text that only names the provider is no send. The evidence is a literal API host or a client call or
+# package name, never the bare provider word: after the `\/` normalisation a gate's own regex source and
+# comments carry the shapes, and a gate file must not count as a sender. Mirrored in email-send-gate.mjs
+# (MAIL_API_RULES); scripts/hooks/mail-api-send-cases.json binds the two twins.
+_ACTION_END = r"(?![A-Za-z0-9_-]|[^\x00-\x7f])"
+_MAIL_API_RULES = (
+    # Gmail: the REST host (also when the URL is assembled from a base) or the Python or Node gmail client;
+    # the send shapes are the messages or drafts send call.
+    (re.compile(r"gmail\.googleapis\.com|[/]gmail[/]v1[/]|\bbuild\s*\(\s*['\"]gmail['\"]|\bgoogle\.gmail\s*\(|['\"]@googleapis/gmail['\"]", re.I),
+     re.compile(r"/(?:messages|drafts)/send" + _ACTION_END + r"|\.(?:messages|drafts)\s*(?:\(\s*\))?\s*\.send\s*\(", re.I)),
+    # Resend: the emails endpoint on the API host (and its batch), or the SDK's emails.send( on a client
+    # of any name (Samu 50950 A1: `const client = new Resend(k)`), the package being the evidence.
+    (re.compile(r"api\.resend\.com|['\"]resend['\"]|\bimport\s+resend\b", re.I),
+     re.compile(r"api\.resend\.com/emails(?:/batch)?" + _ACTION_END + r"|\.emails\.send\s*\(", re.I)),
+    # SendGrid: v3 mail send on the API host, or the mail client.
+    (re.compile(r"api\.sendgrid\.com|['\"]@sendgrid/mail['\"]|\bSendGridAPIClient\s*\(", re.I),
+     re.compile(r"api\.sendgrid\.com/v3/mail/send" + _ACTION_END + r"|['\"]@sendgrid/mail['\"]|\bSendGridAPIClient\s*\(", re.I)),
+    # Mailgun: the API host with a v3 domain messages path (an assembled URL too), or the client's
+    # messages.create( next to the package name. A bare "/messages" is no evidence: the dashboard's own
+    # /api/messages is one.
+    (re.compile(r"mailgun\.net|['\"]mailgun(?:\.js)?['\"]", re.I),
+     re.compile(r"/v3/[^\n]{1,200}?/messages(?:\.mime)?" + _ACTION_END + r"|\.messages\.create\s*\(", re.I)),
+    # Postmark: the email endpoints on the API host (single, batch, with a template).
+    (re.compile(r"api\.postmarkapp\.com", re.I),
+     re.compile(r"api\.postmarkapp\.com/email(?:/batch|/withTemplate)?" + _ACTION_END, re.I)),
+)
+
+def _mail_api_sends(text: str) -> bool:
+    t = text.replace("\\/", "/")
+    return any(ev.search(t) and send.search(t) for ev, send in _MAIL_API_RULES)
+
+
+def _web_mail_sends(text: str) -> bool:
+    """A Microsoft Graph send or an HTTP mail API send in a code string or a script file."""
+    return _graph_sends(text) or _mail_api_sends(text)
+
+
 def _code_string_sends(code: str) -> bool:
-    if _CODE_SEND.search(code) or _CODE_SEND_MODULE.search(code) or _graph_sends(code):
+    if _CODE_SEND.search(code) or _CODE_SEND_MODULE.search(code) or _web_mail_sends(code):
         return True
     return bool(_CODE_EXECISH.search(code) and _CODE_SENDER_LIT.search(code))
 # Token-ELEJERE horgonyzott cel-minta: egy URL-argumentum vagy csupasz
@@ -1105,11 +1145,11 @@ def _local_helper_paths(path, text, kind):
 
 def _file_sends(path, text, kind, read_script) -> bool:
     imports = _PY_MAIL_IMPORT if kind == "py" else _NODE_MAIL_IMPORT
-    if imports.search(text) or _graph_sends(text):
+    if imports.search(text) or _web_mail_sends(text):
         return True
     for h in _local_helper_paths(path, text, kind):
         t = read_script(h, _SCRIPT_READ_LIMIT)
-        if t is not None and (imports.search(t) or _graph_sends(t)):
+        if t is not None and (imports.search(t) or _web_mail_sends(t)):
             return True
     return False
 

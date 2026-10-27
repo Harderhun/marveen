@@ -223,8 +223,41 @@ const graphSends = (text) => {
   const t = text.replaceAll('\\/', '/')
   return GRAPH_SEND.test(t) && GRAPH_EVIDENCE.test(t)
 }
+// MAILGATEHTTPAPI1027: an HTTP mail API reached from a script (a Gmail REST send from urllib went past
+// the main agent's approval gate). Each provider needs its own evidence AND a send shape in the same
+// text, so a Gmail read or a text that only names the provider is no send. The evidence is a literal API
+// host or a client call or package name, never the bare provider word: after the `\/` normalisation a
+// gate's own regex source carries the shapes, and a gate file must not count as a sender. Mirrors
+// _MAIL_API_RULES in hooks/outgoing-copy-gate.py; hooks/mail-api-send-cases.json binds the two twins.
+const ACTION_END = String.raw`(?![A-Za-z0-9_-]|[^\x00-\x7f])`
+const MAIL_API_RULES = [
+  // Gmail: the REST host (also an assembled URL) or the client; the messages or drafts send call.
+  [/gmail\.googleapis\.com|[/]gmail[/]v1[/]|\bbuild\s*\(\s*['"]gmail['"]|\bgoogle\.gmail\s*\(|['"]@googleapis\/gmail['"]/i,
+    new RegExp(String.raw`\/(?:messages|drafts)\/send` + ACTION_END + String.raw`|\.(?:messages|drafts)\s*(?:\(\s*\))?\s*\.send\s*\(`, 'i')],
+  // Resend: the emails endpoint on the API host (and its batch), or the SDK's emails.send( on a client
+  // of any name (Samu 50950 A1: `const client = new Resend(k)`), the package being the evidence.
+  [/api\.resend\.com|['"]resend['"]|\bimport\s+resend\b/i,
+    new RegExp(String.raw`api\.resend\.com\/emails(?:\/batch)?` + ACTION_END + String.raw`|\.emails\.send\s*\(`, 'i')],
+  // SendGrid: v3 mail send on the API host, or the mail client.
+  [/api\.sendgrid\.com|['"]@sendgrid\/mail['"]|\bSendGridAPIClient\s*\(/i,
+    new RegExp(String.raw`api\.sendgrid\.com\/v3\/mail\/send` + ACTION_END + String.raw`|['"]@sendgrid\/mail['"]|\bSendGridAPIClient\s*\(`, 'i')],
+  // Mailgun: the API host with a v3 domain messages path (an assembled URL too), or the client's
+  // messages.create( next to the package name. A bare "/messages" is no evidence: the dashboard's own
+  // /api/messages is one.
+  [/mailgun\.net|['"]mailgun(?:\.js)?['"]/i,
+    new RegExp(String.raw`\/v3\/[^\n]{1,200}?\/messages(?:\.mime)?` + ACTION_END + String.raw`|\.messages\.create\s*\(`, 'i')],
+  // Postmark: the email endpoints on the API host (single, batch, with a template).
+  [/api\.postmarkapp\.com/i,
+    new RegExp(String.raw`api\.postmarkapp\.com\/email(?:\/batch|\/withTemplate)?` + ACTION_END, 'i')],
+]
+const mailApiSends = (text) => {
+  const t = text.replaceAll('\\/', '/')
+  return MAIL_API_RULES.some(([evidence, send]) => evidence.test(t) && send.test(t))
+}
+// A Microsoft Graph send or an HTTP mail API send in a code string or a script file.
+const webMailSends = (text) => graphSends(text) || mailApiSends(text)
 const codeStringSends = (code) =>
-  CODE_SEND.test(code) || CODE_SEND_MODULE.test(code) || graphSends(code) ||
+  CODE_SEND.test(code) || CODE_SEND_MODULE.test(code) || webMailSends(code) ||
   (CODE_EXECISH.test(code) && CODE_SENDER_LIT.test(code))
 
 // Unquoted newline / backtick / `$(` become segment separators; quoted text is
@@ -901,10 +934,10 @@ function localHelperPaths(path, text, kind) {
 
 function fileSends(path, text, kind, readScript) {
   const imports = kind === 'py' ? PY_MAIL_IMPORT : NODE_MAIL_IMPORT
-  if (imports.test(text) || graphSends(text)) return true
+  if (imports.test(text) || webMailSends(text)) return true
   return localHelperPaths(path, text, kind).some((h) => {
     const t = readScript(h)
-    return t !== null && (imports.test(t) || graphSends(t))
+    return t !== null && (imports.test(t) || webMailSends(t))
   })
 }
 
