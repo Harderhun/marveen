@@ -319,3 +319,74 @@ describe('Microsoft Graph sends in a script (MAILGATESCRIPT1027)', () => {
     expect(scriptRunSends('npx harmless-report --to qa@example.test', cwd)).toBe(false)
   })
 })
+
+// MAILGATEDIRZIP1027: a real zip app (stored, __main__.py = print(1)); python runs it, the gate does not unpack it
+const HARMLESS_ZIP = Buffer.from(
+  'UEsDBBQAAAAAAEd9W10GHuE8CQAAAAkAAAALAAAAX19tYWluX18ucHlwcmludCgxKQpQSwECFAMUAAAAAABHfVtdBh7hPAkAAAAJAAAACwAAAAAAAAAAAAAAgAEAAAAAX19tYWluX18ucHlQSwUGAAAAAAEAAQA5AAAAMgAAAAAA',
+  'base64',
+)
+
+describe('python runs a directory or a zip app (MAILGATEDIRZIP1027)', () => {
+  it("reads a directory's __main__.py, and a zip app run by python is a send", () => {
+    const cwd = workdir({
+      'mdir/__main__.py': SMTP_SCRIPT,
+      'cdir/__main__.py': 'print(1)\n',
+      'edir/notes.txt': 'x\n',
+      'plain.py': 'print(1)\n',
+    })
+    writeFileSync(join(cwd, 'app.zip'), HARMLESS_ZIP)
+    writeFileSync(join(cwd, 'app.pyz'), HARMLESS_ZIP)
+    writeFileSync(join(cwd, 'shebang.pyz'), Buffer.concat([Buffer.from('#!/usr/bin/env python3\n'), HARMLESS_ZIP]))
+    chmodSync(join(cwd, 'shebang.pyz'), 0o755)
+    for (const cmd of ['python3 mdir', 'python3 mdir/', `python3 ${join(cwd, 'mdir')}`, 'python3 app.zip', 'python3 app.pyz', './shebang.pyz']) {
+      expect(scriptRunSends(cmd, cwd), cmd).toBe(true)
+      expect(bash(cmd, cwd).deny, cmd).toBe(true)
+    }
+    for (const cmd of ['python3 cdir', 'python3 edir', 'python3 cdir/__main__.py', 'python3 plain.py']) {
+      expect(scriptRunSends(cmd, cwd), cmd).toBe(false)
+      expect(bash(cmd, cwd).deny, cmd).toBe(false)
+    }
+  })
+})
+
+describe('python -m a local module, and node DIR (MAILGATEDIRZIP1027)', () => {
+  it('reads MOD.py or MOD/__main__.py for python -m', () => {
+    const cwd = workdir({
+      'mpkg/__init__.py': '',
+      'mpkg/main.py': SMTP_SCRIPT,
+      'mrun/__main__.py': SMTP_SCRIPT,
+      'mclean/__main__.py': 'print(1)\n',
+    })
+    for (const cmd of ['python3 -m mpkg.main', 'python3 -m mrun', 'python3 -mmrun', 'python3 -u -m mrun', 'python3 -um mpkg.main', 'python3 -BImmpkg.main']) {
+      expect(scriptRunSends(cmd, cwd), cmd).toBe(true)
+      expect(bash(cmd, cwd).deny, cmd).toBe(true)
+    }
+    for (const cmd of ['python3 -m mclean', 'python3 -um mclean', 'python3 -m json.tool', 'python3 -m nosuchmodule']) {
+      expect(scriptRunSends(cmd, cwd), cmd).toBe(false)
+      expect(bash(cmd, cwd).deny, cmd).toBe(false)
+    }
+  })
+
+  it('reads package.json main, else index.js, for node DIR', () => {
+    const cwd = workdir({
+      'nmain/package.json': '{"main": "lib/start.js"}',
+      'nmain/lib/start.js': "const m = require('nodemailer')\n",
+      'nidx/index.js': "const m = require('nodemailer')\n",
+      'nclean/index.js': 'console.log(1)\n',
+      'nbadmain/package.json': '{"main": "lib/start"}',
+      'nbadjson/package.json': '{ not json',
+      'nempty/notes.txt': 'x\n',
+      'nidxmain/package.json': '{"main": "index.js"}',
+      'ndirmain/package.json': '{"main": "index.js"}',
+      'ndirmain/index.js/index.js': "const m = require('nodemailer')\n",
+    })
+    for (const cmd of ['node nmain', 'node nidx', 'node nidx/', 'node nbadmain', 'node nbadjson', 'node nidxmain', 'node ndirmain']) {
+      expect(scriptRunSends(cmd, cwd), cmd).toBe(true)
+      expect(bash(cmd, cwd).deny, cmd).toBe(true)
+    }
+    for (const cmd of ['node nclean', 'node nempty', 'node nclean/index.js']) {
+      expect(scriptRunSends(cmd, cwd), cmd).toBe(false)
+      expect(bash(cmd, cwd).deny, cmd).toBe(false)
+    }
+  })
+})

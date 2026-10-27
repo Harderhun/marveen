@@ -1154,15 +1154,40 @@ def _file_sends(path, text, kind, read_script) -> bool:
     return False
 
 
+# MAILGATEDIRZIP1027: python runs a directory's __main__.py, and a zip app's __main__.py from inside the
+# archive. The archive is not unpacked here, so a zip run by python is a send.
+_ZIP_MAGIC = "PK\x03\x04"
+
+
 def _judge_candidates(paths, kind, read_script):
     """(readable, verdict): a send when ANY readable candidate sends -- the candidates are where the script
     may be (cwd, each `cd` target), and which one runs is not known here; a file over the read limit is a send."""
     readable = False
     for path in paths:
         text = read_script(path, _SCRIPT_READ_LIMIT + 1)
+        if text is None and kind == "py":
+            path = os.path.join(path, "__main__.py")
+            text = read_script(path, _SCRIPT_READ_LIMIT + 1)
+        if text is None and kind == "node":
+            # node runs DIR/package.json "main", else DIR/index.js; a main that cannot be read as named is a send
+            pkg = read_script(os.path.join(path, "package.json"), _SCRIPT_READ_LIMIT + 1)
+            main = None
+            if pkg is not None:
+                try:
+                    data = json.loads(pkg)
+                except ValueError:
+                    return True, True
+                main = data.get("main") if isinstance(data, dict) else None
+            declared = isinstance(main, str) and main != ""
+            path = os.path.normpath(os.path.join(path, main)) if declared else os.path.join(path, "index.js")
+            text = read_script(path, _SCRIPT_READ_LIMIT + 1)
+            if text is None and declared:
+                return True, True
         if text is None:
             continue
         readable = True
+        if kind == "py" and _ZIP_MAGIC in text:
+            return True, True
         if len(text.encode("utf-8")) > _SCRIPT_READ_LIMIT or _file_sends(path, text, kind, read_script):
             return True, True
     return readable, False
@@ -1177,6 +1202,10 @@ def _python_module(rest):
             return rest[i + 1] if i + 1 < len(rest) else None
         if re.match(r"^-m[^-]", t):
             return t[2:]
+        # MAILGATEDIRZIP1027: -m at the end of a cluster of flags without a value (`-um MOD`, `-BmMOD`)
+        cluster = re.match(r"^-[bBdEhiIOPqRsSuvVx]+m(.*)$", t)
+        if cluster:
+            return cluster.group(1) or (rest[i + 1] if i + 1 < len(rest) else None)
         if t in _PY_OPT_WITH_ARG:
             i += 2
             continue
