@@ -30,8 +30,11 @@
 // Python one-liner is an attribute, and a message that mentions config/.env reads nothing. The directory
 // and fixed-file rules do not: naming ~/.ssh is enough.
 // A heredoc body is read only where an interpreter or a shell runs it as its program (`python3 - <<'PY'`,
-// `bash <<EOF`); fed to anything else (`cat > notes.md <<'EOF'`, `gh pr create --body "$(cat <<'EOF' ...)"`,
-// `bash scripts/agent-msg.sh a b - <<'EOF'`) it is data, not a read, and is blanked.
+// `bash <<EOF`, `bash -s`); fed to anything else (`cat > notes.md <<'EOF'`, `gh pr create --body
+// "$(cat <<'EOF' ...)"`, `bash scripts/agent-msg.sh a b - <<'EOF'`) it is data, not a read, and is
+// blanked -- unless the same command can still run or consume it (a pipe into an interpreter or shell,
+// eval, source, `.`, xargs, a `read` loop): then every body is read.
+// Case: on macOS and Windows the comparison is case-insensitive, as the filesystem is.
 //
 // MODE. `warn` (the default): a hit is logged and the call goes through, for the two-day rollout review.
 // `block`: a hit is denied with the rule and the path named. Switch: the `--block` argument, which the
@@ -48,8 +51,9 @@
 //   - other secret files on an install that are not on the list (store/.fal-key, store/*-mcp-key.txt,
 //     store/.fb-page-token ...): adding a rule is a one-line change once the owner names them.
 //
-// Fail-open on unparseable input or an internal error (logged to stderr): a crashed gate must not stop
-// the fleet. Only exit 0 is used; a deny rides on stdout as the PreToolUse decision.
+// An internal error follows the mode: in block mode it denies (fail-closed), in warn mode it is logged
+// as an `internal-error` hit and allowed. Unparseable hook input (not a Bash call at all) exits 0. Only
+// exit 0 is used; a deny rides on stdout as the PreToolUse decision.
 import { readFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, realpathSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
@@ -64,9 +68,19 @@ const ENV_TEMPLATE = /^\.env\.(?:example|sample|template|dist)$/
 // A rule: id (named in the log and the deny), the pattern as a human reads it, and the test on a
 // normalized absolute path. `byName` rules apply only to a path that exists: reading a missing file reveals
 // nothing, and a name in prose (`obj.key`, a message that mentions config/.env) is not a read.
-export function rules(home, root) {
-  const under = (dir) => (p) => p === dir || p.startsWith(dir + sep)
-  const store = join(root, 'store')
+// CASE. The default macOS volume (APFS) and NTFS are case-insensitive: `cat ~/.SSH/ID_RSA` opens
+// ~/.ssh/id_rsa. There every rule compares lower-cased paths; elsewhere the comparison is exact.
+export const CASE_INSENSITIVE_FS = process.platform === 'darwin' || process.platform === 'win32'
+const foldCase = (insensitive) => (insensitive ? (s) => s.toLowerCase() : (s) => s)
+export function rules(home, root, insensitive = CASE_INSENSITIVE_FS) {
+  const fold = foldCase(insensitive)
+  return exactRules(home, root, fold).map((r) => ({ ...r, test: (p) => r.test(fold(p)) }))
+}
+// Every fixed name is written in lower case below, so folding the joined directories is enough.
+function exactRules(rawHome, root, fold) {
+  const home = fold(rawHome)
+  const under = (dir) => { const d = fold(dir); return (p) => p === d || p.startsWith(d + sep) }
+  const store = fold(join(root, 'store'))
   return [
     { id: 'ssh', pattern: '~/.ssh/**', test: under(join(home, '.ssh')) },
     { id: 'aws', pattern: '~/.aws/**', test: under(join(home, '.aws')) },
@@ -81,7 +95,10 @@ export function rules(home, root) {
     { id: 'key', pattern: '**/*.key', byName: true, test: (p) => /.\.key$/.test(basename(p)) },
   ]
 }
-export function allowed(p, root) { return p === join(root, 'store', '.dashboard-token') }
+export function allowed(p, root, insensitive = CASE_INSENSITIVE_FS) {
+  const fold = foldCase(insensitive)
+  return fold(p) === fold(join(root, 'store', '.dashboard-token'))
+}
 
 const INTERPRETER = /^(?:python(?:\d+(?:\.\d+)?)?|node(?:js)?|perl|ruby|php|deno|bun|osascript|bash|sh|zsh|dash|ksh|fish)$/
 
@@ -127,8 +144,17 @@ export function blankInertHeredocs(text) {
     }
     out += c; i++
   }
-  return out
+  // A data heredoc stays data only while nothing in the command can turn it into a program or into
+  // arguments. When the command also pipes into an interpreter or shell, or runs eval / source / `.`,
+  // xargs or a `read` loop, every body is judged as it is written (fail toward reading).
+  return BODY_SINK.test(out) ? src : out
 }
+const BODY_SINK = new RegExp([
+  String.raw`\|\s*(?:(?:[A-Za-z_]\w*=\S*|env|command|exec|nohup|sudo|time)\s+)*(?:\S*\/)?(?:python[\d.]*|node(?:js)?|perl|ruby|php|deno|bun|osascript|bash|sh|zsh|dash|ksh|fish)\b`,
+  String.raw`(?:^|[\s;&|({` + '`' + String.raw`])(?:eval|source|xargs)\b`,
+  String.raw`(?:^|[;&|({\n])\s*\.\s`,
+  String.raw`\bread\b[^;&|\n]*;\s*do\b|\bwhile\b[^\n]*\bread\b`,
+].join('|'))
 
 // Does the segment's program read its PROGRAM from stdin? An interpreter or shell with no script file and
 // no -c / -e code: `python3 - <<'PY'`, `bash <<EOF`, `bash -s`. With a script or code argument the
@@ -187,7 +213,11 @@ const SEPARATORS = /[\s'"`;|&()<>=:,]+/
 function pieces(s) { return s.split(SEPARATORS).filter((x) => x && /[A-Za-z]/.test(x)) }
 
 const MAX_BRACE = 64
+const MAX_BRACE_GROUPS = 32
 export function braceExpand(word) {
+  // The walk recurses once per group: a word with more groups is judged as written (its pieces still
+  // are), so a crafted word cannot run the stack out.
+  if ((word.match(/\{/g) ?? []).length > MAX_BRACE_GROUPS) return [word]
   const out = []
   const walk = (w) => {
     if (out.length > MAX_BRACE) return
@@ -259,11 +289,12 @@ function expandGlob(abs) {
   return paths
 }
 
-function realOrNull(p) { try { return realpathSync(p) } catch { return null } }
+// realpathSync.native asks the OS, which also returns the on-disk case of every component.
+function realOrNull(p) { try { return realpathSync.native(p) } catch { return null } }
 
 // Judge one command: the list of hits, each { rule, pattern, path }. Pure apart from read-only
 // filesystem lookups (existence, directory listing for a glob, symlink target).
-export function findSecretReads(command, { cwd = process.cwd(), home = homedir(), root = ROOT } = {}) {
+export function findSecretReads(command, { cwd = process.cwd(), home = homedir(), root = ROOT, caseInsensitive = CASE_INSENSITIVE_FS } = {}) {
   const text = blankInertHeredocs(String(command ?? '').replace(/\\\r?\n/g, ' '))
   const words = shellWords(text)
   const vars = new Map()
@@ -284,16 +315,18 @@ export function findSecretReads(command, { cwd = process.cwd(), home = homedir()
 
   // Brace lists are expanded on whole words, before the cut: the cut splits on the comma.
   const candidates = new Set([...pieces(text), ...words.flatMap((w) => braceExpand(w).flatMap(pieces))])
-  const ruleList = rules(home, root)
+  const ruleList = rules(home, root, caseInsensitive)
+  const homePrefix = foldCase(caseInsensitive)(home + sep)
   const hits = []
   const seen = new Set()
   const judge = (abs) => {
     for (const p of [abs, realOrNull(abs)]) {
-      if (!p || allowed(p, root)) continue
+      if (!p || allowed(p, root, caseInsensitive)) continue
       for (const r of ruleList) {
         if (!r.test(p) || (r.byName && !existsSync(p))) continue
         const key = `${r.id}\0${p}`
-        if (!seen.has(key)) { seen.add(key); hits.push({ rule: r.id, pattern: r.pattern, path: p.startsWith(home + sep) ? '~' + p.slice(home.length) : p }) }
+        const shown = foldCase(caseInsensitive)(p).startsWith(homePrefix) ? '~' + p.slice(home.length) : p
+        if (!seen.has(key)) { seen.add(key); hits.push({ rule: r.id, pattern: r.pattern, path: shown }) }
       }
     }
   }
@@ -350,13 +383,19 @@ if (isInvokedDirectly()) {
   if (payload?.tool_name !== 'Bash') process.exit(0)
   const command = payload?.tool_input?.command
   const cwd = typeof payload?.cwd === 'string' && payload.cwd.startsWith('/') ? payload.cwd : process.cwd()
+  const mode = readMode()
   let hits
-  try { hits = findSecretReads(command, { cwd }) } catch (e) {
-    process.stderr.write(`secret-read-gate: internal error, allowing: ${e?.message}\n`)
-    process.exit(0)
+  // An internal error is judged by the mode: block fails CLOSED (the call is denied, the reason says the
+  // gate could not read it), warn lets it through and records it, like any other warn-mode finding.
+  try {
+    // Test seam for the error path; the hook's environment is the session's, not something a Bash call sets.
+    if (process.env.SECRET_READ_GATE_FAULT === '1') throw new Error('injected fault')
+    hits = findSecretReads(command, { cwd })
+  } catch (e) {
+    process.stderr.write(`secret-read-gate: internal error (${mode}): ${e?.message}\n`)
+    hits = [{ rule: 'internal-error', pattern: '-', path: String(e?.message ?? e).slice(0, 120) }]
   }
   if (!hits.length) process.exit(0)
-  const mode = readMode()
   try {
     mkdirSync(dirname(LOG_PATH), { recursive: true })
     appendFileSync(LOG_PATH, JSON.stringify({

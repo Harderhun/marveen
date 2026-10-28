@@ -212,6 +212,43 @@ describe('heredoc reading', () => {
   })
 })
 
+// The three gaps the commit review found (case, a data heredoc that is still run, the error path).
+describe('review fixes', () => {
+  it('case: on a case-insensitive filesystem a different case is the same file', () => {
+    const ci = (command: string) => findSecretReads(command, { cwd, home, root, caseInsensitive: true }).map((h: { rule: string }) => h.rule)
+    expect(ci('cat ~/.SSH/config')).toContain('ssh')
+    expect(ci('cat ~/.Aws/Credentials')).toContain('aws')
+    expect(ci('cat ~/.Claude.JSON')).toContain('claude-json')
+    expect(ci(`cat ${root}/STORE/Vault.json`)).toContain('store-vault')
+    expect(ci('cat ../../.ENV')).toContain('env')
+    // ... and the dashboard token stays free in any case.
+    expect(ci(`cat ${root}/store/.Dashboard-Token`)).toEqual([])
+    // A case-sensitive filesystem (Linux) compares exactly: ~/.SSH is another directory there. (A file
+    // that exists is still followed to its real path, so a missing one shows the comparison itself.)
+    expect(findSecretReads('cat ~/.SSH/not-there', { cwd, home, root, caseInsensitive: false })).toEqual([])
+    expect(ci('cat ~/.SSH/not-there')).toContain('ssh')
+  })
+
+  it('a data heredoc that the same command still runs or consumes is read', () => {
+    expect(rulesOf("cat <<'EOF' | bash\ncat ~/.ssh/config\nEOF")).toContain('ssh')
+    expect(rulesOf("cat <<'EOF' | env FOO=1 /bin/sh\ncat ~/.ssh/config\nEOF")).toContain('ssh')
+    expect(rulesOf("tee /tmp/x <<'EOF' | python3\nprint(open('" + home + "/.aws/credentials').read())\nEOF")).toContain('aws')
+    expect(rulesOf("eval \"$(cat <<'EOF'\ncat ~/.ssh/config\nEOF\n)\"")).toContain('ssh')
+    expect(rulesOf("source /dev/stdin <<'EOF'\ncat ~/.ssh/config\nEOF")).toContain('ssh')
+    expect(rulesOf(". /dev/stdin <<'EOF'\ncat ~/.ssh/config\nEOF")).toContain('ssh')
+    expect(rulesOf("xargs cat <<'EOF'\n~/.ssh/config\nEOF")).toContain('ssh')
+    expect(rulesOf("while read f; do cat \"$f\"; done <<'EOF'\n~/.ssh/config\nEOF")).toContain('ssh')
+    expect(rulesOf("bash -s <<'EOF'\ncat ~/.ssh/config\nEOF")).toContain('ssh')
+    // Without a sink the body is still data.
+    expect(rulesOf(`bash ${root}/scripts/agent-msg.sh soma marveen - <<'EOF'\n~/.ssh/config\nEOF`)).toEqual([])
+  })
+
+  it('a word with very many brace groups is judged as written, without a deep walk', () => {
+    const word = '~/.ssh/config' + '{a,b}'.repeat(5000)
+    expect(() => hits(`cat ${word}`)).not.toThrow()
+  })
+})
+
 describe('mode and identity', () => {
   it('warn by default, block by the --block argument, env overrides both ways', () => {
     expect(readMode(['node', 'g.mjs'], {})).toBe('warn')
@@ -268,7 +305,19 @@ describe('the hook process', () => {
     expect(existsSync(log)).toBe(false)
   })
 
-  it('ignores other tools and fails open on garbage input', () => {
+  it('an internal error: block denies (fail-closed), warn allows and records it', () => {
+    const blocked = run(bash('ls'), ['--block'], { SECRET_READ_GATE_FAULT: '1' })
+    expect(blocked.status).toBe(0)
+    const out = JSON.parse(blocked.stdout).hookSpecificOutput
+    expect(out.permissionDecision).toBe('deny')
+    expect(out.permissionDecisionReason).toContain('internal-error')
+    rmSync(log, { force: true })
+    const warned = run(bash('ls'), [], { SECRET_READ_GATE_FAULT: '1' })
+    expect({ status: warned.status, stdout: warned.stdout }).toEqual({ status: 0, stdout: '' })
+    expect(JSON.parse(readFileSync(log, 'utf-8'))).toMatchObject({ mode: 'warn', decision: 'allow', hits: [{ rule: 'internal-error' }] })
+  })
+
+  it('ignores other tools and exits 0 on garbage input', () => {
     expect(run({ tool_name: 'Read', tool_input: { file_path: `${home}/.ssh/config` } }, ['--block']).stdout).toBe('')
     const g = run('not json', ['--block'])
     expect({ status: g.status, stdout: g.stdout }).toEqual({ status: 0, stdout: '' })

@@ -818,14 +818,18 @@ main agent) and catches a command that **refers** to a secret path, whatever the
 - read forms: `~`, `$HOME`, `${HOME}`, absolute and relative (against the cwd and every `cd` in the
   command), quoting removed, brace lists, variables set in the same command, globs expanded against
   the filesystem, symlinks followed; interpreter one-liners and a heredoc that is a program are read
-  as text; a heredoc that is data (`cat > f <<EOF`, a message body) is not;
+  as text; a heredoc that is data (`cat > f <<EOF`, a message body) is not, unless the same command
+  can still run or consume it (a pipe into an interpreter or shell, `eval`, `source`, `.`, `xargs`, a
+  `read` loop), in which case every body is read;
+- on macOS and Windows the comparison is case-insensitive, like the filesystem (`~/.SSH` is `~/.ssh`);
 - the file-name rules need the file to exist, so `obj.key` or a message mentioning `config/.env` does
   not count.
 
 **Mode.** The dashboard setting `SECRET_READ_GATE_BLOCK` (default off). Off = warn: the call goes
 through and `store/secret-read-gate.log` records the agent, rule, pattern, path, program names and a
 hash of the command (never its text). On = block: the call is denied with the rule and the path
-named. The setting reaches the agents as the hook's `--block` argument at the next dashboard restart.
+named. An internal error in the gate denies in block mode (fail-closed) and is logged and allowed in
+warn mode. The setting reaches the agents as the hook's `--block` argument at the next dashboard restart.
 It is deliberately not a store file: a sub-agent could rewrite one to switch itself back to warn.
 
 `SECRET_READ_DENY` in `agent-scaffold.ts` is the second layer, on the same sub-agents:
