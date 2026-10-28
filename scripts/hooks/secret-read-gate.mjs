@@ -146,7 +146,7 @@ export function blankInertHeredocs(text, { shellOnly = false } = {}) {
       const bodyLen = m ? m.index : rest.length
       const body = rest.slice(0, bodyLen)
       const prog = programOnStdin(out.slice(segStart))
-      out += (shellOnly ? SHELL.test(prog) : prog) ? body : body.replace(/[^\n]/g, ' ')
+      out += (shellOnly ? prog && (SHELL.test(prog) || SHELL_OUT.test(body)) : prog) ? body : body.replace(/[^\n]/g, ' ')
       i += bodyLen
       continue
     }
@@ -182,6 +182,9 @@ function programOnStdin(segment) {
   return prog
 }
 const SHELL = /^(?:bash|sh|zsh|dash|ksh|fish)$/
+// A program body that hands a string to a shell: that shell brace-expands it, so the body stays in the
+// brace pass (fail toward reading).
+const SHELL_OUT = /\bsystem\s*\(|\bpopen\b|subprocess|shell\s*=\s*True|\bexec(?:Sync|File|FileSync)?\s*\(|\bspawn(?:Sync)?\s*\(|shell_exec|passthru|proc_open|do shell script|`|\bos\.exec|\bcommands\.|\bsh\s*\(|%x[({[]/
 
 // The program a segment runs: past assignments and the usual prefix words, without its directory.
 const PREFIX = new Set(['env', 'sudo', 'command', 'exec', 'time', 'nohup', 'nice', 'timeout', 'stdbuf', 'builtin', 'then', 'do', 'else', '!', '{'])

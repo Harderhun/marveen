@@ -278,6 +278,12 @@ describe('review fixes', () => {
     expect(rulesOf("bash <<'EOF'\ncat ~/.{ssh,x}/config\nEOF")).toContain('ssh')
     expect(rulesOf("sh -s <<'EOF'\ntar czf /tmp/x.tgz ~/.{ssh,aws}\nEOF")).toEqual(['aws', 'ssh'])
     expect(rulesOf("cat <<'EOF' | bash\ncat ~/.{ssh,x}/config\nEOF")).toContain('ssh')
+    // A program body that shells out: the shell it calls expands the braces.
+    expect(rulesOf("python3 - <<'PY'\nimport os\nos.system('cat ~/.{ssh,x}/config')\nPY")).toContain('ssh')
+    expect(rulesOf("node - <<'JS'\nrequire('child_process').execSync('cat ~/.{ssh,x}/config')\nJS")).toContain('ssh')
+    expect(rulesOf("php <<'PHP'\n<?php echo shell_exec('cat ~/.{ssh,x}/config');\nPHP")).toContain('ssh')
+    // ... but a DATA body that merely mentions a shell-out stays data.
+    expect(rulesOf("cat > probe.mjs <<'EOF'\nexecSync('cat ~/.{ssh,aws}/config')\nEOF")).toEqual([])
     // A JSON or PHP body in a program heredoc is code, not a brace list.
     expect(rulesOf("python3 - <<'PY'\n" + "d = {'a': 1, 'b': 2}\n".repeat(200) + "print(json.dumps({'x':[1,2,3]}))\nPY")).toEqual([])
     // An ordinary brace list stays an ordinary list.
