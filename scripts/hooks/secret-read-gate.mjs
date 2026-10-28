@@ -212,34 +212,46 @@ export function shellWords(text) {
 const SEPARATORS = /[\s'"`;|&()<>=:,]+/
 function pieces(s) { return s.split(SEPARATORS).filter((x) => x && /[A-Za-z]/.test(x)) }
 
-const MAX_BRACE = 64
-const MAX_BRACE_GROUPS = 32
-export function braceExpand(word) {
-  // The walk recurses once per group: a word with more groups is judged as written (its pieces still
-  // are), so a crafted word cannot run the stack out.
-  if ((word.match(/\{/g) ?? []).length > MAX_BRACE_GROUPS) return [word]
-  const out = []
-  const walk = (w) => {
-    if (out.length > MAX_BRACE) return
-    for (let i = 0; i < w.length; i++) {
-      if (w[i] !== '{' || w[i - 1] === '$') continue
-      let depth = 0
-      let j = i
-      const commas = []
-      for (; j < w.length; j++) {
-        if (w[j] === '{') depth++
-        else if (w[j] === '}' && --depth === 0) break
-        else if (w[j] === ',' && depth === 1) commas.push(j)
-      }
-      if (j >= w.length || !commas.length) continue
-      let from = i + 1
-      for (const c of [...commas, j]) { walk(w.slice(0, i) + w.slice(from, c) + w.slice(j + 1)); from = c + 1 }
-      return
+// The first brace list in a word that bash expands ({a,b}; not ${VAR} and not a comma-less {x}), as
+// its variants, or null.
+function firstBraceList(w) {
+  for (let i = 0; i < w.length; i++) {
+    if (w[i] !== '{' || w[i - 1] === '$') continue
+    let depth = 0
+    let j = i
+    const commas = []
+    for (; j < w.length; j++) {
+      if (w[j] === '{') depth++
+      else if (w[j] === '}' && --depth === 0) break
+      else if (w[j] === ',' && depth === 1) commas.push(j)
     }
-    out.push(w)
+    if (j >= w.length || !commas.length) continue
+    const variants = []
+    let from = i + 1
+    for (const c of [...commas, j]) { variants.push(w.slice(0, i) + w.slice(from, c) + w.slice(j + 1)); from = c + 1 }
+    return variants
   }
-  walk(word)
-  return out.slice(0, MAX_BRACE)
+  return null
+}
+
+// Brace expansion, iterative and bounded: at most MAX_BRACE finished words and MAX_BRACE_STEPS list
+// expansions, so a crafted word can neither run the stack out nor blow up. A word whose expansion does
+// not fit the budget is NOT judged as written (a padded `~/.{ssh,x}` would pass that way): the result
+// says `truncated`, and the caller counts it as a finding.
+const MAX_BRACE = 64
+const MAX_BRACE_STEPS = 256
+export function braceExpand(word) {
+  const words = []
+  const work = [word]
+  let steps = 0
+  while (work.length) {
+    const w = work.shift()
+    const variants = firstBraceList(w)
+    if (!variants) { words.push(w); if (words.length > MAX_BRACE) return { words: words.slice(0, MAX_BRACE), truncated: true }; continue }
+    if (++steps > MAX_BRACE_STEPS || work.length + variants.length > MAX_BRACE * 4) return { words, truncated: true }
+    work.push(...variants)
+  }
+  return { words, truncated: false }
 }
 
 const HOME_IN_CODE = /Path\.home\(|expanduser|homedir\(|os\.environ(?:\.get)?[[(]\s*['"]HOME|getenv\(\s*['"]HOME|ENV\[\s*['"]HOME|process\.env\.HOME|\$ENV\{HOME\}|\$HOME\b|\$\{HOME\}/
@@ -314,10 +326,14 @@ export function findSecretReads(command, { cwd = process.cwd(), home = homedir()
   if (homeInCode) bases.push(home)
 
   // Brace lists are expanded on whole words, before the cut: the cut splits on the comma.
-  const candidates = new Set([...pieces(text), ...words.flatMap((w) => braceExpand(w).flatMap(pieces))])
+  const expanded = words.map(braceExpand)
+  const candidates = new Set([...pieces(text), ...expanded.flatMap((e) => e.words.flatMap(pieces))])
   const ruleList = rules(home, root, caseInsensitive)
   const homePrefix = foldCase(caseInsensitive)(home + sep)
   const hits = []
+  // A word whose brace expansion is over budget cannot be read to the end: a finding of its own
+  // (logged in warn mode, denied in block mode), never a pass.
+  if (expanded.some((e) => e.truncated)) hits.push({ rule: 'unreadable-braces', pattern: `brace expansion over ${MAX_BRACE} words`, path: '-' })
   const seen = new Set()
   const judge = (abs) => {
     for (const p of [abs, realOrNull(abs)]) {
@@ -331,7 +347,7 @@ export function findSecretReads(command, { cwd = process.cwd(), home = homedir()
     }
   }
   for (const raw of candidates) {
-    for (const variant of braceExpand(raw)) {
+    for (const variant of braceExpand(raw).words) {
       const x = expandVars(variant, vars, home)
       // `process.env.HOME + '/.ssh/x'`: next to code that builds a home path, a leading `/` piece is
       // also read as home-relative.

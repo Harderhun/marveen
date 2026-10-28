@@ -243,9 +243,14 @@ describe('review fixes', () => {
     expect(rulesOf(`bash ${root}/scripts/agent-msg.sh soma marveen - <<'EOF'\n~/.ssh/config\nEOF`)).toEqual([])
   })
 
-  it('a word with very many brace groups is judged as written, without a deep walk', () => {
-    const word = '~/.ssh/config' + '{a,b}'.repeat(5000)
-    expect(() => hits(`cat ${word}`)).not.toThrow()
+  it('brace expansion is bounded, and a word over the budget is a finding, never a pass', () => {
+    // ${HOME} and comma-less {x} are not brace lists, so padding with them changes nothing.
+    expect(rulesOf('cat ~/.{ssh,x}/config' + '${HOME}'.repeat(40) + '{y}'.repeat(40))).toContain('ssh')
+    // 2^5000 variants: neither a deep walk nor a blow-up, and the word is flagged.
+    expect(() => hits(`cat ~/.{ssh,x}/config${'{a,b}'.repeat(5000)}`)).not.toThrow()
+    expect(rulesOf(`cat ${'{a,b}'.repeat(40)}~/.{ssh,x}/config`)).toContain('unreadable-braces')
+    // An ordinary brace list stays an ordinary list.
+    expect(rulesOf('mkdir -p /tmp/x/{a,b,c}/{d,e}')).toEqual([])
   })
 })
 
