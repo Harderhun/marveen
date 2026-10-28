@@ -286,6 +286,10 @@ describe('review fixes', () => {
     expect(rulesOf("python3 - <<'PY'\nimport os\ngetattr(os, 'sys' + 'tem')('cat ~/.{ssh,x}/config')\nPY")).toContain('ssh')
     expect(rulesOf("perl <<'PL'\nprint qx{cat ~/.{ssh,x}/config};\nPL")).toContain('ssh')
     expect(rulesOf("deno run - <<'TS'\nnew Deno.Command('sh', { args: ['-c', 'cat ~/.{ssh,x}/config'] })\nTS")).toContain('ssh')
+    // Padding a program body past every budget does not hide a list either: the linear fallback.
+    expect(rulesOf("python3 - <<'PY'\nimport os\ngetattr(os, 'sys' + 'tem')('cat ~/.{ssh,x}/config" + '{a,b}'.repeat(300) + "')\nPY")).toContain('ssh')
+    expect(rulesOf("python3 - <<'PY'\nimport os\ngetattr(os, 'sys' + 'tem')('cat " + '{a,b}'.repeat(300) + "~/.{x,ssh}/config')\nPY")).toContain('ssh')
+    expect(rulesOf("python3 - <<'PY'\n" + Array.from({ length: 600 }, (_, n) => `x${n}={${n},${n + 1}}`).join('\n') + "\ngetattr(os, 'sys' + 'tem')('cat ~/.{x,ssh}/config')\nPY")).toContain('ssh')
     // ... but a DATA body that merely mentions a shell-out stays data.
     expect(rulesOf("cat > probe.mjs <<'EOF'\nexecSync('cat ~/.{ssh,aws}/config')\nEOF")).toEqual([])
     // A JSON or PHP body in a program heredoc is code, not a brace list.
