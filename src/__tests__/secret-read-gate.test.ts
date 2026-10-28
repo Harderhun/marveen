@@ -282,6 +282,10 @@ describe('review fixes', () => {
     expect(rulesOf("python3 - <<'PY'\nimport os\nos.system('cat ~/.{ssh,x}/config')\nPY")).toContain('ssh')
     expect(rulesOf("node - <<'JS'\nrequire('child_process').execSync('cat ~/.{ssh,x}/config')\nJS")).toContain('ssh')
     expect(rulesOf("php <<'PHP'\n<?php echo shell_exec('cat ~/.{ssh,x}/config');\nPHP")).toContain('ssh')
+    // No list of shell-out forms is needed for the expansion itself: every program body is expanded.
+    expect(rulesOf("python3 - <<'PY'\nimport os\ngetattr(os, 'sys' + 'tem')('cat ~/.{ssh,x}/config')\nPY")).toContain('ssh')
+    expect(rulesOf("perl <<'PL'\nprint qx{cat ~/.{ssh,x}/config};\nPL")).toContain('ssh')
+    expect(rulesOf("deno run - <<'TS'\nnew Deno.Command('sh', { args: ['-c', 'cat ~/.{ssh,x}/config'] })\nTS")).toContain('ssh')
     // ... but a DATA body that merely mentions a shell-out stays data.
     expect(rulesOf("cat > probe.mjs <<'EOF'\nexecSync('cat ~/.{ssh,aws}/config')\nEOF")).toEqual([])
     // A JSON or PHP body in a program heredoc is code, not a brace list.

@@ -173,8 +173,10 @@ function programOnStdin(segment) {
   while (k < ws.length && (/^[A-Za-z_]\w*=/.test(ws[k]) || PREFIX.has(ws[k]))) k++
   const prog = basename(ws[k] ?? '')
   if (!INTERPRETER.test(prog)) return ''
-  for (const w of ws.slice(k + 1)) {
+  for (const [n, w] of ws.slice(k + 1).entries()) {
     if (w === '-' || w === '-s') continue
+    // `deno run -`, `bun run -`: the subcommand, then the program from stdin.
+    if (n === 0 && w === 'run' && /^(?:deno|bun)$/.test(prog)) continue
     if (/^-(?:c|e|E|r|p)$|^--(?:command|eval|print)$/.test(w)) return ''
     if (/^-/.test(w)) continue
     return ''
@@ -182,9 +184,9 @@ function programOnStdin(segment) {
   return prog
 }
 const SHELL = /^(?:bash|sh|zsh|dash|ksh|fish)$/
-// A program body that hands a string to a shell: that shell brace-expands it, so the body stays in the
-// brace pass (fail toward reading).
-const SHELL_OUT = /\bsystem\s*\(|\bpopen\b|subprocess|shell\s*=\s*True|\bexec(?:Sync|File|FileSync)?\s*\(|\bspawn(?:Sync)?\s*\(|shell_exec|passthru|proc_open|do shell script|`|\bos\.exec|\bcommands\.|\bsh\s*\(|%x[({[]/
+// A program body that hands a string to a shell: there an over-budget brace word is a finding too. (Its
+// brace lists are expanded anyway, see findSecretReads; this list only widens the over-budget rule.)
+const SHELL_OUT = /\b(?:system|exec|popen|spawn\w*|qx)\b|subprocess|shell\s*=\s*True|execSync|execFile|shell_exec|passthru|proc_open|do shell script|`|\bos\.exec|\bcommands\.|\bsh\s*\(|%x[({[]|open\s*\([^)]*\|\s*['"]|Deno\.Command|Bun\.spawn/
 
 // The program a segment runs: past assignments and the usual prefix words, without its directory.
 const PREFIX = new Set(['env', 'sudo', 'command', 'exec', 'time', 'nohup', 'nice', 'timeout', 'stdbuf', 'builtin', 'then', 'do', 'else', '!', '{'])
@@ -253,6 +255,7 @@ function firstBraceList(w) {
 const MAX_BRACE = 64
 const MAX_BRACE_STEPS = 256
 const MAX_BRACE_WORD = 4096
+const MAX_BRACE_TOKENS = 512
 export function braceExpand(word) {
   // A cheap cap first: a word this long, or with this many braces, is not read at all (a finding).
   if (word.length > MAX_BRACE_WORD || (word.match(/\{/g) ?? []).length > MAX_BRACE_STEPS) return { words: [], truncated: true }
@@ -341,19 +344,27 @@ export function findSecretReads(command, { cwd = process.cwd(), home = homedir()
   if (homeInCode) bases.push(home)
 
   // Brace lists are expanded on whole words, before the cut: the cut splits on the comma.
-  // Bash brace-expands shell text only: its own words and the body of a heredoc a shell runs (or that
-  // the command still pipes on, see BODY_SINK), never a python / node / php program body, so a JSON or
-  // PHP body is not read as a brace list. The expansion (and its over-budget finding) runs on that text.
-  const shellTokens = blankInertHeredocs(String(command ?? '').replace(/\\\r?\n/g, ' '), { shellOnly: true })
-    .split(/\s+/).filter((t) => t.includes('{'))
-  const expanded = shellTokens.flatMap((t) => shellWords(t)).map(braceExpand)
+  // Brace lists are expanded in every PROGRAM text, the command's own words and every program body
+  // (`text`: data bodies blanked), and only the expanded variants are judged, so a JSON or PHP body
+  // costs nothing: its `{a,b}` variants match no rule. A list of ways a body can reach a shell would
+  // never be complete, so none is needed for that part. The OVER-BUDGET finding is narrower: it counts
+  // only in shell text (the command's words and the bodies a shell runs or the command pipes on, plus
+  // a body with a recognised shell-out), where bash really expands; a program body over the budget is
+  // judged as written. The number of brace words is bounded per command too.
+  const braceTokens = (t) => t.split(/\s+/).filter((x) => x.includes('{')).flatMap((x) => shellWords(x))
+  const shellText = new Set(braceTokens(blankInertHeredocs(String(command ?? '').replace(/\\\r?\n/g, ' '), { shellOnly: true })))
+  const programTokens = braceTokens(text)
+  const overTokens = programTokens.length > MAX_BRACE_TOKENS
+  const expanded = programTokens.slice(0, MAX_BRACE_TOKENS).map((t) => ({ ...braceExpand(t), shell: shellText.has(t) }))
   const candidates = new Set([...pieces(text), ...words.flatMap(pieces), ...expanded.flatMap((e) => e.words.flatMap(pieces))])
   const ruleList = rules(home, root, caseInsensitive)
   const homePrefix = foldCase(caseInsensitive)(home + sep)
   const hits = []
-  // A word whose brace expansion is over budget cannot be read to the end: a finding of its own
-  // (logged in warn mode, denied in block mode), never a pass.
-  if (expanded.some((e) => e.truncated)) hits.push({ rule: 'unreadable-braces', pattern: `brace expansion over ${MAX_BRACE} words`, path: '-' })
+  // A shell word whose brace expansion is over budget cannot be read to the end: a finding of its own
+  // (logged in warn mode, denied in block mode), never a pass. So is a command with more brace words
+  // than the per-command budget, when the words past it are shell text.
+  const overShell = overTokens && programTokens.slice(MAX_BRACE_TOKENS).some((t) => shellText.has(t))
+  if (overShell || expanded.some((e) => e.truncated && e.shell)) hits.push({ rule: 'unreadable-braces', pattern: `brace expansion over ${MAX_BRACE} words`, path: '-' })
   const seen = new Set()
   const judge = (abs) => {
     for (const p of [abs, realOrNull(abs)]) {
