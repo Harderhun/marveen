@@ -110,7 +110,9 @@ const INTERPRETER = /^(?:python(?:\d+(?:\.\d+)?)?|node(?:js)?|perl|ruby|php|deno
 // Blank the body of every heredoc that is not a program's input. The scan tracks quotes so a `<<` inside
 // a quoted string is not an operator; the command word is the first word of the segment the operator
 // sits in. Length-preserving, so nothing else moves.
-export function blankInertHeredocs(text, { all = false } = {}) {
+// `shellOnly` (the brace-expansion pass): keep only the bodies a SHELL runs as its program, since bash
+// brace-expands those and python / node / php never do; the sink rule below still keeps every body.
+export function blankInertHeredocs(text, { shellOnly = false } = {}) {
   const src = String(text ?? '')
   let out = ''
   let i = 0
@@ -143,7 +145,8 @@ export function blankInertHeredocs(text, { all = false } = {}) {
       const m = endRx.exec(rest)
       const bodyLen = m ? m.index : rest.length
       const body = rest.slice(0, bodyLen)
-      out += !all && programOnStdin(out.slice(segStart)) ? body : body.replace(/[^\n]/g, ' ')
+      const prog = programOnStdin(out.slice(segStart))
+      out += (shellOnly ? SHELL.test(prog) : prog) ? body : body.replace(/[^\n]/g, ' ')
       i += bodyLen
       continue
     }
@@ -152,7 +155,7 @@ export function blankInertHeredocs(text, { all = false } = {}) {
   // A data heredoc stays data only while nothing in the command can turn it into a program or into
   // arguments. When the command also pipes into an interpreter or shell, or runs eval / source / `.`,
   // xargs or a `read` loop, every body is judged as it is written (fail toward reading).
-  return !all && BODY_SINK.test(out) ? src : out
+  return BODY_SINK.test(out) ? src : out
 }
 const BODY_SINK = new RegExp([
   String.raw`\|\s*(?:(?:[A-Za-z_]\w*=\S*|env|command|exec|nohup|sudo|time)\s+)*(?:\S*\/)?(?:python[\d.]*|node(?:js)?|perl|ruby|php|deno|bun|osascript|bash|sh|zsh|dash|ksh|fish)\b`,
@@ -161,22 +164,24 @@ const BODY_SINK = new RegExp([
   String.raw`\bread\b[^;&|\n]*;\s*do\b|\bwhile\b[^\n]*\bread\b`,
 ].join('|'))
 
-// Does the segment's program read its PROGRAM from stdin? An interpreter or shell with no script file and
+// Does the segment's program read its PROGRAM from stdin? Its name if so, else ''. An interpreter or shell with no script file and
 // no -c / -e code: `python3 - <<'PY'`, `bash <<EOF`, `bash -s`. With a script or code argument the
 // heredoc is that program's DATA (`bash scripts/agent-msg.sh a b - <<'EOF'`), and data is not a read.
 function programOnStdin(segment) {
   const ws = shellWords(segment.replace(/<<.*$/s, ''))
   let k = 0
   while (k < ws.length && (/^[A-Za-z_]\w*=/.test(ws[k]) || PREFIX.has(ws[k]))) k++
-  if (!INTERPRETER.test(basename(ws[k] ?? ''))) return false
+  const prog = basename(ws[k] ?? '')
+  if (!INTERPRETER.test(prog)) return ''
   for (const w of ws.slice(k + 1)) {
     if (w === '-' || w === '-s') continue
-    if (/^-(?:c|e|E|r|p)$|^--(?:command|eval|print)$/.test(w)) return false
+    if (/^-(?:c|e|E|r|p)$|^--(?:command|eval|print)$/.test(w)) return ''
     if (/^-/.test(w)) continue
-    return false
+    return ''
   }
-  return true
+  return prog
 }
+const SHELL = /^(?:bash|sh|zsh|dash|ksh|fish)$/
 
 // The program a segment runs: past assignments and the usual prefix words, without its directory.
 const PREFIX = new Set(['env', 'sudo', 'command', 'exec', 'time', 'nohup', 'nice', 'timeout', 'stdbuf', 'builtin', 'then', 'do', 'else', '!', '{'])
@@ -333,10 +338,10 @@ export function findSecretReads(command, { cwd = process.cwd(), home = homedir()
   if (homeInCode) bases.push(home)
 
   // Brace lists are expanded on whole words, before the cut: the cut splits on the comma.
-  // Bash brace-expands its own unquoted words only, never a heredoc body or the code of a -c / -e
-  // string: the expansion (and its over-budget finding) runs on the command's shell words, cut on
-  // whitespace with every heredoc body blanked, so a JSON or PHP body is not read as a brace list.
-  const shellTokens = blankInertHeredocs(String(command ?? '').replace(/\\\r?\n/g, ' '), { all: true })
+  // Bash brace-expands shell text only: its own words and the body of a heredoc a shell runs (or that
+  // the command still pipes on, see BODY_SINK), never a python / node / php program body, so a JSON or
+  // PHP body is not read as a brace list. The expansion (and its over-budget finding) runs on that text.
+  const shellTokens = blankInertHeredocs(String(command ?? '').replace(/\\\r?\n/g, ' '), { shellOnly: true })
     .split(/\s+/).filter((t) => t.includes('{'))
   const expanded = shellTokens.flatMap((t) => shellWords(t)).map(braceExpand)
   const candidates = new Set([...pieces(text), ...words.flatMap(pieces), ...expanded.flatMap((e) => e.words.flatMap(pieces))])

@@ -274,6 +274,10 @@ describe('review fixes', () => {
     expect(rulesOf('echo ' + '{'.repeat(200000))).toContain('unreadable-braces')
     expect(rulesOf('echo ' + '{,'.repeat(2000))).toContain('unreadable-braces')
     expect(Date.now() - t0).toBeLessThan(2000)
+    // A brace list in a body a shell runs, or pipes on, is expanded like any shell word.
+    expect(rulesOf("bash <<'EOF'\ncat ~/.{ssh,x}/config\nEOF")).toContain('ssh')
+    expect(rulesOf("sh -s <<'EOF'\ntar czf /tmp/x.tgz ~/.{ssh,aws}\nEOF")).toEqual(['aws', 'ssh'])
+    expect(rulesOf("cat <<'EOF' | bash\ncat ~/.{ssh,x}/config\nEOF")).toContain('ssh')
     // A JSON or PHP body in a program heredoc is code, not a brace list.
     expect(rulesOf("python3 - <<'PY'\n" + "d = {'a': 1, 'b': 2}\n".repeat(200) + "print(json.dumps({'x':[1,2,3]}))\nPY")).toEqual([])
     // An ordinary brace list stays an ordinary list.
