@@ -1,0 +1,379 @@
+#!/usr/bin/env node
+// PreToolUse hook (Bash): the secret-read gate. SECRETREADGATE1028, kanban 3ddab86a, owner GO for the PR
+// (2026-10-28).
+//
+// WHY A HOOK. Permissive sub-agents run with --dangerously-skip-permissions, so a profile's allow list
+// does not bind them; what binds is permissions.deny (checked before the bypass) and PreToolUse hooks.
+// FLEET_BASELINE_DENY denies the credential directories in Read(...) form only, so the same files were
+// one `cat ~/.ssh/id_ed25519` or `python3 -c "open('.env')"` away from the shell. This hook judges the
+// Bash command line and stops a command that REFERS to a secret path, whatever program it names.
+//
+// PROTECTED (see RULES): ~/.ssh/**, ~/.aws/**, ~/.gnupg/**, ~/Library/Keychains/**, ~/.claude.json and
+// its backups (~/.claude.json.*), <root>/store/vault*, <root>/store/.claude-oauth-token*, and by file
+// name anywhere: .env, .env.* (not the .example / .sample / .template / .dist templates),
+// service-account*.json, *.pem, *.key.
+// ALWAYS FREE: <root>/store/.dashboard-token. Every agent reads it in each dashboard call
+// (`curl -H "Authorization: Bearer $(cat .../store/.dashboard-token)" http://localhost:...`); a gate that
+// stopped it would silence the fleet.
+//
+// HOW IT READS THE COMMAND. It does not try to know which programs read files: any reference counts, an
+// argument of cat / cp / tar / base64 as much as a path inside a `python3 -c` or `node -e` body. The
+// command text is cut into path-shaped candidates twice, as written and with shell quoting removed (so
+// `~/.s"s"h` is ~/.ssh), and each candidate is
+//   - expanded: brace lists, `~`, `$HOME`, `${HOME}`, and variables assigned in the same command;
+//   - resolved: an absolute path as it is, a relative one against the hook's cwd and every `cd` /
+//     `pushd` target in the command (a bare `cd` is home), and against home when the code builds a
+//     home path (Path.home(), expanduser, os.homedir(), $HOME ...);
+//   - glob-expanded against the filesystem when it holds * ? [ (bounded), so `~/.ss?/id*` is caught;
+//   - followed through a symlink when it exists, so a link made earlier into ~/.ssh is caught.
+// The file-name rules (.env, *.pem, *.key, service-account*.json) need the file to exist: `obj.key` in a
+// Python one-liner is an attribute, and a message that mentions config/.env reads nothing. The directory
+// and fixed-file rules do not: naming ~/.ssh is enough.
+// A heredoc body is read only where an interpreter or a shell runs it as its program (`python3 - <<'PY'`,
+// `bash <<EOF`); fed to anything else (`cat > notes.md <<'EOF'`, `gh pr create --body "$(cat <<'EOF' ...)"`,
+// `bash scripts/agent-msg.sh a b - <<'EOF'`) it is data, not a read, and is blanked.
+//
+// MODE. `warn` (the default): a hit is logged and the call goes through, for the two-day rollout review.
+// `block`: a hit is denied with the rule and the path named. Switch: the `--block` argument, which the
+// scaffold writes from the SECRET_READ_GATE_BLOCK dashboard setting (not a store file a sub-agent could
+// rewrite to switch itself back); env SECRET_READ_GATE_MODE=block|warn overrides it, for tests. The log
+// (store/secret-read-gate.log, JSONL) holds time, mode, agent, cwd, rule, pattern, the matched path, the
+// program names of the command and a hash of it -- never the command text, which may carry a value.
+//
+// WHAT THIS DOES NOT CLOSE, said here so nobody reads "merged" as "closed":
+//   - a script written to a file first and run afterwards: the hook sees the script's name only;
+//   - a path assembled at run time from pieces (`'.ss' + 'h'`, `${X}h`, base64, a value read from a file);
+//   - a relative path behind a cd the command does not show (an earlier call's cwd is not tracked beyond
+//     the payload's cwd);
+//   - other secret files on an install that are not on the list (store/.fal-key, store/*-mcp-key.txt,
+//     store/.fb-page-token ...): adding a rule is a one-line change once the owner names them.
+//
+// Fail-open on unparseable input or an internal error (logged to stderr): a crashed gate must not stop
+// the fleet. Only exit 0 is used; a deny rides on stdout as the PreToolUse decision.
+import { readFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, realpathSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { dirname, join, resolve, basename, isAbsolute, sep } from 'node:path'
+import { homedir } from 'node:os'
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
+export const LOG_PATH = process.env.SECRET_READ_GATE_LOG || join(ROOT, 'store', 'secret-read-gate.log')
+
+const ENV_TEMPLATE = /^\.env\.(?:example|sample|template|dist)$/
+
+// A rule: id (named in the log and the deny), the pattern as a human reads it, and the test on a
+// normalized absolute path. `byName` rules apply only to a path that exists: reading a missing file reveals
+// nothing, and a name in prose (`obj.key`, a message that mentions config/.env) is not a read.
+export function rules(home, root) {
+  const under = (dir) => (p) => p === dir || p.startsWith(dir + sep)
+  const store = join(root, 'store')
+  return [
+    { id: 'ssh', pattern: '~/.ssh/**', test: under(join(home, '.ssh')) },
+    { id: 'aws', pattern: '~/.aws/**', test: under(join(home, '.aws')) },
+    { id: 'gnupg', pattern: '~/.gnupg/**', test: under(join(home, '.gnupg')) },
+    { id: 'keychains', pattern: '~/Library/Keychains/**', test: under(join(home, 'Library', 'Keychains')) },
+    { id: 'claude-json', pattern: '~/.claude.json', test: (p) => dirname(p) === home && /^\.claude\.json(?:\..*)?$/.test(basename(p)) },
+    { id: 'store-vault', pattern: '${PROJECT_ROOT}/store/vault*', test: (p) => dirname(p) === store && basename(p).startsWith('vault') },
+    { id: 'oauth-token', pattern: '${PROJECT_ROOT}/store/.claude-oauth-token', test: (p) => dirname(p) === store && basename(p).startsWith('.claude-oauth-token') },
+    { id: 'env', pattern: '**/.env, **/.env.*', byName: true, test: (p) => { const b = basename(p); return b === '.env' || (b.startsWith('.env.') && !ENV_TEMPLATE.test(b)) } },
+    { id: 'service-account', pattern: '**/service-account*.json', byName: true, test: (p) => /^service-account.*\.json$/.test(basename(p)) },
+    { id: 'pem', pattern: '**/*.pem', byName: true, test: (p) => /.\.pem$/.test(basename(p)) },
+    { id: 'key', pattern: '**/*.key', byName: true, test: (p) => /.\.key$/.test(basename(p)) },
+  ]
+}
+export function allowed(p, root) { return p === join(root, 'store', '.dashboard-token') }
+
+const INTERPRETER = /^(?:python(?:\d+(?:\.\d+)?)?|node(?:js)?|perl|ruby|php|deno|bun|osascript|bash|sh|zsh|dash|ksh|fish)$/
+
+// Blank the body of every heredoc that is not a program's input. The scan tracks quotes so a `<<` inside
+// a quoted string is not an operator; the command word is the first word of the segment the operator
+// sits in. Length-preserving, so nothing else moves.
+export function blankInertHeredocs(text) {
+  const src = String(text ?? '')
+  let out = ''
+  let i = 0
+  let quote = null
+  let segStart = 0
+  // A $( ... ) inside double quotes runs a command: its text is unquoted again until the matching ).
+  const outer = []
+  while (i < src.length) {
+    const c = src[i]
+    if (quote === '"' && c === '$' && src[i + 1] === '(') { outer.push(quote); quote = null; out += '$('; i += 2; segStart = out.length; continue }
+    if (quote) {
+      if (c === '\\' && quote === '"' && i + 1 < src.length) { out += src.slice(i, i + 2); i += 2; continue }
+      if (c === quote) quote = null
+      out += c; i++; continue
+    }
+    if (c === ')' && outer.length) { quote = outer.pop(); out += c; i++; continue }
+    if (c === '$' && src[i + 1] === '(') { outer.push(null); out += '$('; i += 2; segStart = out.length; continue }
+    if (c === "'" || c === '"' || c === '`') { quote = c === '`' ? null : c; out += c; i++; continue }
+    if (c === '\\' && i + 1 < src.length) { out += src.slice(i, i + 2); i += 2; continue }
+    if (c === ';' || c === '|' || c === '&' || c === '\n' || c === '(') { segStart = out.length + 1 }
+    const here = c === '<' ? /^<<-?[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|([A-Za-z_][\w.-]*))/.exec(src.slice(i)) : null
+    if (here && src[i + 2] !== '<') {
+      const tag = here[1] ?? here[2] ?? here[3]
+      out += here[0]; i += here[0].length
+      const nl = src.indexOf('\n', i)
+      if (nl === -1) { out += src.slice(i); break }
+      out += src.slice(i, nl + 1); i = nl + 1
+      const endRx = new RegExp(`^[ \\t]*${tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[ \\t]*$`, 'm')
+      const rest = src.slice(i)
+      const m = endRx.exec(rest)
+      const bodyLen = m ? m.index : rest.length
+      const body = rest.slice(0, bodyLen)
+      out += programOnStdin(out.slice(segStart)) ? body : body.replace(/[^\n]/g, ' ')
+      i += bodyLen
+      continue
+    }
+    out += c; i++
+  }
+  return out
+}
+
+// Does the segment's program read its PROGRAM from stdin? An interpreter or shell with no script file and
+// no -c / -e code: `python3 - <<'PY'`, `bash <<EOF`, `bash -s`. With a script or code argument the
+// heredoc is that program's DATA (`bash scripts/agent-msg.sh a b - <<'EOF'`), and data is not a read.
+function programOnStdin(segment) {
+  const ws = shellWords(segment.replace(/<<.*$/s, ''))
+  let k = 0
+  while (k < ws.length && (/^[A-Za-z_]\w*=/.test(ws[k]) || PREFIX.has(ws[k]))) k++
+  if (!INTERPRETER.test(basename(ws[k] ?? ''))) return false
+  for (const w of ws.slice(k + 1)) {
+    if (w === '-' || w === '-s') continue
+    if (/^-(?:c|e|E|r|p)$|^--(?:command|eval|print)$/.test(w)) return false
+    if (/^-/.test(w)) continue
+    return false
+  }
+  return true
+}
+
+// The program a segment runs: past assignments and the usual prefix words, without its directory.
+const PREFIX = new Set(['env', 'sudo', 'command', 'exec', 'time', 'nohup', 'nice', 'timeout', 'stdbuf', 'builtin', 'then', 'do', 'else', '!', '{'])
+function commandWord(segment) {
+  for (const w of shellWords(segment)) {
+    if (/^[A-Za-z_]\w*=/.test(w) || PREFIX.has(w) || /^-/.test(w) || /^\d+$/.test(w)) continue
+    return basename(w)
+  }
+  return ''
+}
+
+// Split into words, honouring quotes and backslashes (the text itself is not run).
+export function shellWords(text) {
+  const out = []
+  let cur = null
+  let i = 0
+  const push = () => { if (cur !== null) out.push(cur); cur = null }
+  while (i < text.length) {
+    const c = text[i]
+    if (/\s/.test(c)) { push(); i++; continue }
+    cur ??= ''
+    if (c === "'") { const e = text.indexOf("'", i + 1); const end = e === -1 ? text.length : e; cur += text.slice(i + 1, end); i = end + 1; continue }
+    if (c === '"') {
+      let j = i + 1
+      // Inside double quotes bash drops a backslash only before $ ` " \ and a newline: `"\.env"` stays a
+      // regex, not the file .env.
+      while (j < text.length && text[j] !== '"') { if (text[j] === '\\' && j + 1 < text.length && /[$`"\\\n]/.test(text[j + 1])) { cur += text[j + 1]; j += 2; continue } cur += text[j]; j++ }
+      i = j + 1; continue
+    }
+    if (c === '\\' && i + 1 < text.length) { cur += text[i + 1]; i += 2; continue }
+    cur += c; i++
+  }
+  push()
+  return out
+}
+
+// Path-shaped pieces: everything between characters a path in this install does not contain.
+const SEPARATORS = /[\s'"`;|&()<>=:,]+/
+function pieces(s) { return s.split(SEPARATORS).filter((x) => x && /[A-Za-z]/.test(x)) }
+
+const MAX_BRACE = 64
+export function braceExpand(word) {
+  const out = []
+  const walk = (w) => {
+    if (out.length > MAX_BRACE) return
+    for (let i = 0; i < w.length; i++) {
+      if (w[i] !== '{' || w[i - 1] === '$') continue
+      let depth = 0
+      let j = i
+      const commas = []
+      for (; j < w.length; j++) {
+        if (w[j] === '{') depth++
+        else if (w[j] === '}' && --depth === 0) break
+        else if (w[j] === ',' && depth === 1) commas.push(j)
+      }
+      if (j >= w.length || !commas.length) continue
+      let from = i + 1
+      for (const c of [...commas, j]) { walk(w.slice(0, i) + w.slice(from, c) + w.slice(j + 1)); from = c + 1 }
+      return
+    }
+    out.push(w)
+  }
+  walk(word)
+  return out.slice(0, MAX_BRACE)
+}
+
+const HOME_IN_CODE = /Path\.home\(|expanduser|homedir\(|os\.environ(?:\.get)?[[(]\s*['"]HOME|getenv\(\s*['"]HOME|ENV\[\s*['"]HOME|process\.env\.HOME|\$ENV\{HOME\}|\$HOME\b|\$\{HOME\}/
+
+function expandVars(s, vars, home) {
+  let x = s.replace(/^~(?=\/|$)/, home).replace(/\$\{HOME\}|\$HOME\b|\$ENV\{HOME\}/g, home)
+  for (let k = 0; k < 2; k++) {
+    x = x.replace(/\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)/g, (m, a, b) => (vars.has(a ?? b) ? vars.get(a ?? b) : m))
+  }
+  return x.replace(/^~(?=\/|$)/, home)
+}
+
+const MAX_GLOB = 256
+function globRegex(seg) {
+  let re = ''
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i]
+    if (c === '*') re += '.*'
+    else if (c === '?') re += '.'
+    else if (c === '[') {
+      const e = seg.indexOf(']', i + 2)
+      if (e === -1) { re += '\\['; continue }
+      re += '[' + seg.slice(i + 1, e).replace(/^[!^]/, '^').replace(/[\\\]]/g, '\\$&') + ']'
+      i = e
+    } else re += c.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+  }
+  try { return new RegExp(`^${re}$`) } catch { return null }
+}
+// Expand an absolute glob against the filesystem, the way bash would.
+function expandGlob(abs) {
+  let paths = [sep]
+  for (const seg of abs.split(sep).filter(Boolean)) {
+    const next = []
+    for (const p of paths) {
+      if (!/[*?[]/.test(seg)) { next.push(join(p, seg)); continue }
+      const re = globRegex(seg)
+      if (!re) continue
+      let names = []
+      try { names = readdirSync(p) } catch { continue }
+      // As bash without dotglob: a leading dot is matched only by a segment that starts with one.
+      for (const n of names) if (re.test(n) && (!n.startsWith('.') || seg.startsWith('.'))) next.push(join(p, n))
+      if (next.length > MAX_GLOB) break
+    }
+    paths = next.slice(0, MAX_GLOB)
+    if (!paths.length) break
+  }
+  return paths
+}
+
+function realOrNull(p) { try { return realpathSync(p) } catch { return null } }
+
+// Judge one command: the list of hits, each { rule, pattern, path }. Pure apart from read-only
+// filesystem lookups (existence, directory listing for a glob, symlink target).
+export function findSecretReads(command, { cwd = process.cwd(), home = homedir(), root = ROOT } = {}) {
+  const text = blankInertHeredocs(String(command ?? '').replace(/\\\r?\n/g, ' '))
+  const words = shellWords(text)
+  const vars = new Map()
+  for (const w of words) {
+    const m = /^([A-Za-z_]\w*)=(.*)$/s.exec(w)
+    if (m) vars.set(m[1], m[2].split(/[;&|]/)[0])
+  }
+  const bases = [isAbsolute(cwd) ? cwd : process.cwd()]
+  const cdRx = /(?:^|[;&|(\n{]|\bthen|\bdo)\s*(?:cd|pushd)(?=[\s;&|)]|$)([^;&|)\n]*)/g
+  for (const m of text.matchAll(cdRx)) {
+    const arg = shellWords(m[1]).find((w) => !/^-/.test(w))
+    if (!arg) { bases.push(home); continue }
+    const t = expandVars(arg, vars, home)
+    if (!t.includes('$')) bases.push(isAbsolute(t) ? resolve(t) : resolve(bases[0], t))
+  }
+  const homeInCode = HOME_IN_CODE.test(text)
+  if (homeInCode) bases.push(home)
+
+  // Brace lists are expanded on whole words, before the cut: the cut splits on the comma.
+  const candidates = new Set([...pieces(text), ...words.flatMap((w) => braceExpand(w).flatMap(pieces))])
+  const ruleList = rules(home, root)
+  const hits = []
+  const seen = new Set()
+  const judge = (abs) => {
+    for (const p of [abs, realOrNull(abs)]) {
+      if (!p || allowed(p, root)) continue
+      for (const r of ruleList) {
+        if (!r.test(p) || (r.byName && !existsSync(p))) continue
+        const key = `${r.id}\0${p}`
+        if (!seen.has(key)) { seen.add(key); hits.push({ rule: r.id, pattern: r.pattern, path: p.startsWith(home + sep) ? '~' + p.slice(home.length) : p }) }
+      }
+    }
+  }
+  for (const raw of candidates) {
+    for (const variant of braceExpand(raw)) {
+      const x = expandVars(variant, vars, home)
+      // `process.env.HOME + '/.ssh/x'`: next to code that builds a home path, a leading `/` piece is
+      // also read as home-relative.
+      const targets = isAbsolute(x)
+        ? [resolve(x), ...(homeInCode ? [resolve(home, '.' + x)] : [])]
+        : bases.map((b) => resolve(b, x))
+      for (const t of targets) {
+        if (/[*?[]/.test(t)) {
+          judge(t)
+          for (const g of expandGlob(t)) judge(g)
+        } else {
+          judge(t)
+        }
+      }
+    }
+  }
+  return hits
+}
+
+export function readMode(argv = process.argv, env = process.env) {
+  const fromEnv = env.SECRET_READ_GATE_MODE
+  if (fromEnv === 'block' || fromEnv === 'warn') return fromEnv
+  return argv.includes('--block') ? 'block' : 'warn'
+}
+
+// Who ran it, for the review: the agent directory the session lives in, from its config dir or cwd.
+export function agentOf(env = process.env, cwd = '') {
+  for (const p of [env.CLAUDE_CONFIG_DIR ?? '', cwd]) {
+    const m = /\/agents\/([^/]+)(?:\/|$)/.exec(p)
+    if (m) return m[1]
+  }
+  return null
+}
+
+function programsOf(command) {
+  const text = blankInertHeredocs(String(command ?? ''))
+  return [...new Set(text.split(/[;&|\n]+|\$\(|`/).map(commandWord).filter(Boolean))].slice(0, 8)
+}
+
+export const GATE_MSG = 'szef-kapu: a parancs titkos utvonalra hivatkozik, ezert TILTVA. A titkos fajlokat (kulcsok, tokenek, .env) ugynok shellbol nem olvashatja; ha a feladathoz tenyleg kell, szolj a fo-ugynoknek.'
+
+function isInvokedDirectly() {
+  try { return realpathSync(fileURLToPath(import.meta.url)) === (process.argv[1] ? realpathSync(process.argv[1]) : '') } catch { return false }
+}
+
+if (isInvokedDirectly()) {
+  let payload
+  try { payload = JSON.parse(readFileSync(0, 'utf-8')) } catch { process.exit(0) }
+  if (payload?.tool_name !== 'Bash') process.exit(0)
+  const command = payload?.tool_input?.command
+  const cwd = typeof payload?.cwd === 'string' && payload.cwd.startsWith('/') ? payload.cwd : process.cwd()
+  let hits
+  try { hits = findSecretReads(command, { cwd }) } catch (e) {
+    process.stderr.write(`secret-read-gate: internal error, allowing: ${e?.message}\n`)
+    process.exit(0)
+  }
+  if (!hits.length) process.exit(0)
+  const mode = readMode()
+  try {
+    mkdirSync(dirname(LOG_PATH), { recursive: true })
+    appendFileSync(LOG_PATH, JSON.stringify({
+      ts: new Date().toISOString(),
+      mode,
+      decision: mode === 'block' ? 'deny' : 'allow',
+      agent: agentOf(process.env, cwd),
+      cwd,
+      hits,
+      programs: programsOf(command),
+      cmd_sha256: createHash('sha256').update(String(command ?? '')).digest('hex').slice(0, 16),
+      cmd_len: String(command ?? '').length,
+    }) + '\n')
+  } catch { /* warn still allows, block still denies: the log is the record, not the decision */ }
+  if (mode === 'block') {
+    const named = hits.slice(0, 3).map((h) => `${h.rule}: ${h.path} (${h.pattern})`).join('; ')
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: `${GATE_MSG} (${named})` } }))
+  }
+  process.exit(0)
+}

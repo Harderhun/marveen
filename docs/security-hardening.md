@@ -802,3 +802,38 @@ environment. The URL is checked before the request is built: `http` or
 `https`, no user info, and the host `127.0.0.1`, `::1` or `localhost`. Any other
 URL is refused like an unreachable dashboard (audit mode: the local fallback with
 a warning; enforce mode: exit 5), so the token never leaves the machine.
+
+# Secret reads from the shell (the secret-read gate)
+
+SECRETREADGATE1028. Permissive sub-agents run with `--dangerously-skip-permissions`, so only
+`permissions.deny` and `PreToolUse` hooks bind them, and the fleet floor denied the credential
+directories in `Read(...)` form only: `cat ~/.ssh/id_ed25519` or `python3 -c "open('.env')"` went
+through. `scripts/hooks/secret-read-gate.mjs` judges every Bash call of every sub-agent (never the
+main agent) and catches a command that **refers** to a secret path, whatever the program:
+
+- protected: `~/.ssh/**`, `~/.aws/**`, `~/.gnupg/**`, `~/Library/Keychains/**`, `~/.claude.json`
+  (and its backups), `store/vault*`, `store/.claude-oauth-token`, and by file name `.env`, `.env.*`
+  (not `.env.example` / `.sample` / `.template` / `.dist`), `service-account*.json`, `*.pem`, `*.key`;
+- always free: `store/.dashboard-token`, read in every dashboard call;
+- read forms: `~`, `$HOME`, `${HOME}`, absolute and relative (against the cwd and every `cd` in the
+  command), quoting removed, brace lists, variables set in the same command, globs expanded against
+  the filesystem, symlinks followed; interpreter one-liners and a heredoc that is a program are read
+  as text; a heredoc that is data (`cat > f <<EOF`, a message body) is not;
+- the file-name rules need the file to exist, so `obj.key` or a message mentioning `config/.env` does
+  not count.
+
+**Mode.** The dashboard setting `SECRET_READ_GATE_BLOCK` (default off). Off = warn: the call goes
+through and `store/secret-read-gate.log` records the agent, rule, pattern, path, program names and a
+hash of the command (never its text). On = block: the call is denied with the rule and the path
+named. The setting reaches the agents as the hook's `--block` argument at the next dashboard restart.
+It is deliberately not a store file: a sub-agent could rewrite one to switch itself back to warn.
+
+`SECRET_READ_DENY` in `agent-scaffold.ts` is the second layer, on the same sub-agents:
+`Read(~/.claude.json)`, `Read(store/vault*)`, `Read(store/.claude-oauth-token)` and the two exact
+`cat ~/.ssh/*`, `cat ~/.aws/*` text rules. It is not in `FLEET_BASELINE_DENY`, because that list is
+also the main agent's floor (the tracked `.claude/settings.json`, which binds the owner's own sessions
+in this repo too), and the main agent reads the HarderPM key from `~/.claude.json`.
+
+**Not covered, stated out loud:** a script written to a file and run afterwards (the hook sees its
+name only); a path assembled at run time from pieces; a relative path behind a `cd` an earlier call
+made; secret files not on the list (`store/.fal-key`, `store/*-mcp-key.txt`, `store/.fb-page-token`).
