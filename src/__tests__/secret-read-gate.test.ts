@@ -290,6 +290,11 @@ describe('review fixes', () => {
     expect(rulesOf("python3 - <<'PY'\nimport os\ngetattr(os, 'sys' + 'tem')('cat ~/.{ssh,x}/config" + '{a,b}'.repeat(300) + "')\nPY")).toContain('ssh')
     expect(rulesOf("python3 - <<'PY'\nimport os\ngetattr(os, 'sys' + 'tem')('cat " + '{a,b}'.repeat(300) + "~/.{x,ssh}/config')\nPY")).toContain('ssh')
     expect(rulesOf("python3 - <<'PY'\n" + Array.from({ length: 600 }, (_, n) => `x${n}={${n},${n + 1}}`).join('\n') + "\ngetattr(os, 'sys' + 'tem')('cat ~/.{x,ssh}/config')\nPY")).toContain('ssh')
+    // A path-shaped word over a budget is a finding in a program body too; so is a nested list in a
+    // fallback word and a command past the total work budget.
+    expect(rulesOf("python3 - <<'PY'\nimport os\ngetattr(os, 'sys' + 'tem')('cat " + '{a,b}'.repeat(300) + "~/.{x,{y,ssh}}/config')\nPY")).toContain('unreadable-braces')
+    expect(rulesOf("python3 - <<'PY'\nimport os\ngetattr(os, 'sys' + 'tem')('cat ~/." + '{a,b}'.repeat(80) + "{x,s{s,y}h}/config')\nPY")).toContain('unreadable-braces')
+    expect(rulesOf("python3 - <<'PY'\n" + Array.from({ length: 3000 }, (_, n) => `v${n}='{' + '${'x,'.repeat(300)}y' + '}'`).join('\n') + "\nPY")).toEqual([])
     // ... but a DATA body that merely mentions a shell-out stays data.
     expect(rulesOf("cat > probe.mjs <<'EOF'\nexecSync('cat ~/.{ssh,aws}/config')\nEOF")).toEqual([])
     // A JSON or PHP body in a program heredoc is code, not a brace list.

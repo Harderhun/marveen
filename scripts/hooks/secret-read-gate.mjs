@@ -257,6 +257,7 @@ const MAX_BRACE_STEPS = 256
 const MAX_BRACE_WORD = 4096
 const MAX_BRACE_TOKENS = 512
 const MAX_LINEAR = 1024
+const MAX_BRACE_CHARS = 4_000_000
 // The fallback when a word does not fit the full expansion: every alternative of every top-level brace
 // list once, with the other lists set to their first alternative, and once with them removed. Linear in
 // the number of alternatives instead of their product. It does not reproduce every combination, but the
@@ -286,11 +287,13 @@ export function linearBraceVariants(word) {
     groups.forEach((g, gi) => { out += word.slice(from, g.at) + pick(gi, g); from = g.end + 1 })
     return out + word.slice(from)
   }
+  // Every alternative of every list gets its "others removed" variant before any cap applies; the cap
+  // only trims the "others at their first alternative" set after it.
   const variants = new Set([build((_, g) => g.alts[0]), build(() => '')])
+  for (let i = 0; i < groups.length; i++) for (const alt of groups[i].alts) variants.add(build((gi) => (gi === i ? alt : '')))
   for (let i = 0; i < groups.length && variants.size < MAX_LINEAR; i++) {
     for (const alt of groups[i].alts) {
       variants.add(build((gi, g) => (gi === i ? alt : g.alts[0])))
-      variants.add(build((gi) => (gi === i ? alt : '')))
       if (variants.size >= MAX_LINEAR) break
     }
   }
@@ -394,20 +397,30 @@ export function findSecretReads(command, { cwd = process.cwd(), home = homedir()
   // judged as written. The number of brace words is bounded per command too.
   const braceTokens = (t) => t.split(/\s+/).filter((x) => x.includes('{')).flatMap((x) => shellWords(x))
   const shellText = new Set(braceTokens(blankInertHeredocs(String(command ?? '').replace(/\\\r?\n/g, ' '), { shellOnly: true })))
-  // Deduplicated; past the per-command budget a word gets the linear fallback, never nothing.
+  // Deduplicated; past the per-command budget a word gets the linear fallback, never nothing. The total
+  // work is capped as well (MAX_BRACE_CHARS over all variants): past it, no more expansion, a finding.
   const programTokens = [...new Set(braceTokens(text))]
-  const expanded = programTokens.map((t, n) => (n < MAX_BRACE_TOKENS
-    ? { ...braceExpand(t), shell: shellText.has(t) }
-    : { words: linearBraceVariants(t), truncated: true, shell: shellText.has(t) }))
+  let budget = MAX_BRACE_CHARS
+  let overWork = false
+  const expanded = []
+  for (const [n, t] of programTokens.entries()) {
+    if (budget <= 0) { overWork = true; break }
+    const e = n < MAX_BRACE_TOKENS ? braceExpand(t) : { words: linearBraceVariants(t), truncated: true }
+    // A list nested in a fallback word's alternative is not expanded by the linear fallback: unreadable.
+    const nested = e.truncated && /\{[^{}]*,[^{}]*\{[^{}]*,/.test(t)
+    budget -= e.words.reduce((a, w) => a + w.length, 0)
+    expanded.push({ ...e, shell: shellText.has(t), pathShaped: /[~/]/.test(t), nested })
+  }
   const candidates = new Set([...pieces(text), ...words.flatMap(pieces), ...expanded.flatMap((e) => e.words.flatMap(pieces))])
   const ruleList = rules(home, root, caseInsensitive)
   const homePrefix = foldCase(caseInsensitive)(home + sep)
   const hits = []
-  // Every word over a budget is still judged, on its linear variants. A SHELL word over a budget is a
-  // finding of its own besides (logged in warn mode, denied in block mode): bash expands it in full, and
-  // the linear variants are not every combination. A program-body word is not, because a JSON or PHP
-  // body would then deny ordinary work (measured: 43 of Neo's 9118 commands).
-  if (expanded.some((e) => e.truncated && e.shell)) hits.push({ rule: 'unreadable-braces', pattern: `brace expansion over ${MAX_BRACE} words`, path: '-' })
+  // Every word over a budget is still judged, on its linear variants. Besides, it is a finding of its
+  // own (logged in warn mode, denied in block mode) when it is shell text (bash expands it in full) or
+  // PATH-SHAPED (holds `~` or `/`) anywhere: the linear variants are not every combination. A program-body
+  // word with neither is not a finding, because JSON / PHP bodies would then deny ordinary work. So is a
+  // command past the total work budget, and a fallback word with a nested list.
+  if (overWork || expanded.some((e) => e.truncated && (e.shell || e.pathShaped || e.nested))) hits.push({ rule: 'unreadable-braces', pattern: `brace expansion over ${MAX_BRACE} words`, path: '-' })
   const seen = new Set()
   const judge = (abs) => {
     for (const p of [abs, realOrNull(abs)]) {
