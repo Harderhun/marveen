@@ -1366,6 +1366,10 @@ export const SECRET_READ_DENY = [
   'Read(${HOME}/.claude.json)',
   'Read(${PROJECT_ROOT}/store/vault*)',
   'Read(${PROJECT_ROOT}/store/.claude-oauth-token)',
+  'Read(${PROJECT_ROOT}/store/.fal-key*)',
+  'Read(${PROJECT_ROOT}/store/.fb-page-token)',
+  'Read(${PROJECT_ROOT}/store/.launch-secrets)',
+  'Read(${PROJECT_ROOT}/store/*-mcp-key*.txt)',
 ]
 
 // Idempotently merge the egress deny rules into a settings object's

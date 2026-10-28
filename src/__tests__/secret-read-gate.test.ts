@@ -67,6 +67,15 @@ beforeAll(() => {
     [join(root, 'store', 'vault-bindings.json')]: '{}',
     [join(root, 'store', '.claude-oauth-token')]: 't',
     [join(root, 'store', '.dashboard-token')]: 't',
+    [join(root, 'store', '.fal-key')]: 'k',
+    [join(root, 'store', '.fal-key-pixel')]: 'k',
+    [join(root, 'store', '.fb-page-token')]: 'k',
+    [join(root, 'store', '.launch-secrets')]: 'k',
+    [join(root, 'store', 'dentalsalon-mcp-key.txt')]: 'k',
+    [join(root, 'store', 'dentalsalon-mcp-key-ro.txt')]: 'k',
+    [join(root, 'store', 'kisallatdoki-mcp-key.txt')]: 'k',
+    [join(root, 'store', 'kisallatdoki-mcp', 'kmcp.py')]: '#',
+    [join(root, 'scripts', 'fb-page.py')]: '#',
     [join(root, 'README.md')]: '# x',
     [join(cwd, 'cert', 'server.pem')]: 'p',
     [join(cwd, 'cert', 'server.key')]: 'p',
@@ -146,8 +155,15 @@ describe('(a) a reference to a secret path is caught', () => {
     expect(rulesOf('cd && cat .aws/credentials')).toContain('aws')
     expect(rulesOf(`cd ${root}/store && cat vault.json`)).toContain('store-vault')
     // As bash: `*` skips dot files, `.c*` does not.
-    expect(rulesOf(`cat ${root}/store/*`)).toEqual(['store-vault'])
+    expect(rulesOf(`cat ${root}/store/*`)).toEqual(['store-secret', 'store-vault'])
     expect(rulesOf(`cat ${root}/store/.c*`)).toEqual(['oauth-token'])
+  })
+
+  it('the store credentials (owner decision 2026-10-28)', () => {
+    for (const f of ['.fal-key', '.fal-key-pixel', '.fb-page-token', '.launch-secrets', 'dentalsalon-mcp-key.txt', 'dentalsalon-mcp-key-ro.txt', 'kisallatdoki-mcp-key.txt']) {
+      expect(rulesOf(`cat store/${f}`, root)).toEqual(['store-secret'])
+    }
+    expect(rulesOf(`python3 -c "print(open('${root}/store/.fal-key').read())"`)).toEqual(['store-secret'])
   })
 
   it('a symlink that points into a protected directory', () => {
@@ -170,6 +186,10 @@ describe('(b) the ordinary work passes', () => {
     `cat jelentes.md | bash ${root}/scripts/agent-msg.sh soma marveen -`,
     `bash ${root}/scripts/agent-msg.sh soma marveen - <<'EOF'\nA config/.env-et es a ~/.ssh-t nem olvastam.\nEOF`,
     `bash ${root}/scripts/agent-mem.sh soma hot`,
+    // The store credentials' own scripts read them inside: running them is not a reference.
+    `cd ${root} && python3 scripts/fb-page.py post --page x --message "szia"`,
+    `cd ${root} && python3 store/kisallatdoki-mcp/kmcp.py tool @x.json`,
+    `python3 ${root}/store/kisallatdoki-mcp/kmcp.py tool @x.json`,
     // Soma's GA4 report: the service-account key is read INSIDE the script, which the gate does not see.
     `cd ${root}/store/dentalsalon-ga4 && ${home}/code/mcp-ga4/.venv/bin/python jelentes.py`,
     `cd ${root}/.claude/skills/levai-havi-jelentes/scripts && python3 stdio_mcp.py gscServer get_advanced_search_analytics '{"siteUrl":"sc-domain:x.hu"}'`,
@@ -249,6 +269,13 @@ describe('review fixes', () => {
     // 2^5000 variants: neither a deep walk nor a blow-up, and the word is flagged.
     expect(() => hits(`cat ~/.{ssh,x}/config${'{a,b}'.repeat(5000)}`)).not.toThrow()
     expect(rulesOf(`cat ${'{a,b}'.repeat(40)}~/.{ssh,x}/config`)).toContain('unreadable-braces')
+    // Unmatched braces cost one pass, not a rescan per brace, and a huge word is a finding.
+    const t0 = Date.now()
+    expect(rulesOf('echo ' + '{'.repeat(200000))).toContain('unreadable-braces')
+    expect(rulesOf('echo ' + '{,'.repeat(2000))).toContain('unreadable-braces')
+    expect(Date.now() - t0).toBeLessThan(2000)
+    // A JSON or PHP body in a program heredoc is code, not a brace list.
+    expect(rulesOf("python3 - <<'PY'\n" + "d = {'a': 1, 'b': 2}\n".repeat(200) + "print(json.dumps({'x':[1,2,3]}))\nPY")).toEqual([])
     // An ordinary brace list stays an ordinary list.
     expect(rulesOf('mkdir -p /tmp/x/{a,b,c}/{d,e}')).toEqual([])
   })
@@ -427,6 +454,7 @@ describe('the migration on an existing agent', () => {
     for (const rule of ['Bash(cat ~/.ssh/*)', 'Bash(cat ~/.aws/*)']) expect(deny).toContain(rule)
     expect(deny).toContain(`Read(/${join(PROJECT_ROOT, 'store', 'vault*')})`)
     expect(deny).toContain(`Read(/${join(PROJECT_ROOT, 'store', '.claude-oauth-token')})`)
+    for (const f of ['.fal-key*', '.fb-page-token', '.launch-secrets', '*-mcp-key*.txt']) expect(deny).toContain(`Read(/${join(PROJECT_ROOT, 'store', f)})`)
     expect(deny.some((r) => r.includes('.dashboard-token'))).toBe(false)
   })
 })

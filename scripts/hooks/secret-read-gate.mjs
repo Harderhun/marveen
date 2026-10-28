@@ -9,7 +9,8 @@
 // Bash command line and stops a command that REFERS to a secret path, whatever program it names.
 //
 // PROTECTED (see RULES): ~/.ssh/**, ~/.aws/**, ~/.gnupg/**, ~/Library/Keychains/**, ~/.claude.json and
-// its backups (~/.claude.json.*), <root>/store/vault*, <root>/store/.claude-oauth-token*, and by file
+// its backups (~/.claude.json.*), <root>/store/vault*, <root>/store/.claude-oauth-token*, the other store
+// credentials (store/.fal-key*, store/.fb-page-token, store/.launch-secrets, store/*-mcp-key*.txt), and by file
 // name anywhere: .env, .env.* (not the .example / .sample / .template / .dist templates),
 // service-account*.json, *.pem, *.key.
 // ALWAYS FREE: <root>/store/.dashboard-token. Every agent reads it in each dashboard call
@@ -48,8 +49,7 @@
 //   - a path assembled at run time from pieces (`'.ss' + 'h'`, `${X}h`, base64, a value read from a file);
 //   - a relative path behind a cd the command does not show (an earlier call's cwd is not tracked beyond
 //     the payload's cwd);
-//   - other secret files on an install that are not on the list (store/.fal-key, store/*-mcp-key.txt,
-//     store/.fb-page-token ...): adding a rule is a one-line change once the owner names them.
+//   - a secret file that is not on the list: adding a rule is a one-line change once the owner names it.
 //
 // An internal error follows the mode: in block mode it denies (fail-closed), in warn mode it is logged
 // as an `internal-error` hit and allowed. Unparseable hook input (not a Bash call at all) exits 0. Only
@@ -64,6 +64,8 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 export const LOG_PATH = process.env.SECRET_READ_GATE_LOG || join(ROOT, 'store', 'secret-read-gate.log')
 
 const ENV_TEMPLATE = /^\.env\.(?:example|sample|template|dist)$/
+// Lower case on purpose: the rules compare case-folded names on a case-insensitive filesystem.
+const STORE_SECRET = /^(?:\.fal-key.*|\.fb-page-token.*|\.launch-secrets.*|.+-mcp-key.*\.txt)$/
 
 // A rule: id (named in the log and the deny), the pattern as a human reads it, and the test on a
 // normalized absolute path. `byName` rules apply only to a path that exists: reading a missing file reveals
@@ -89,6 +91,9 @@ function exactRules(rawHome, root, fold) {
     { id: 'claude-json', pattern: '~/.claude.json', test: (p) => dirname(p) === home && /^\.claude\.json(?:\..*)?$/.test(basename(p)) },
     { id: 'store-vault', pattern: '${PROJECT_ROOT}/store/vault*', test: (p) => dirname(p) === store && basename(p).startsWith('vault') },
     { id: 'oauth-token', pattern: '${PROJECT_ROOT}/store/.claude-oauth-token', test: (p) => dirname(p) === store && basename(p).startsWith('.claude-oauth-token') },
+    // The install's other credentials (owner decision, 2026-10-28): read by their own scripts (fb-page.py,
+    // kmcp.py, fal-mcp-bekotes.sh), which run untouched -- the hook sees only the script's name.
+    { id: 'store-secret', pattern: '${PROJECT_ROOT}/store/{.fal-key*,.fb-page-token,.launch-secrets,*-mcp-key*.txt}', test: (p) => dirname(p) === store && STORE_SECRET.test(basename(p)) },
     { id: 'env', pattern: '**/.env, **/.env.*', byName: true, test: (p) => { const b = basename(p); return b === '.env' || (b.startsWith('.env.') && !ENV_TEMPLATE.test(b)) } },
     { id: 'service-account', pattern: '**/service-account*.json', byName: true, test: (p) => /^service-account.*\.json$/.test(basename(p)) },
     { id: 'pem', pattern: '**/*.pem', byName: true, test: (p) => /.\.pem$/.test(basename(p)) },
@@ -105,7 +110,7 @@ const INTERPRETER = /^(?:python(?:\d+(?:\.\d+)?)?|node(?:js)?|perl|ruby|php|deno
 // Blank the body of every heredoc that is not a program's input. The scan tracks quotes so a `<<` inside
 // a quoted string is not an operator; the command word is the first word of the segment the operator
 // sits in. Length-preserving, so nothing else moves.
-export function blankInertHeredocs(text) {
+export function blankInertHeredocs(text, { all = false } = {}) {
   const src = String(text ?? '')
   let out = ''
   let i = 0
@@ -138,7 +143,7 @@ export function blankInertHeredocs(text) {
       const m = endRx.exec(rest)
       const bodyLen = m ? m.index : rest.length
       const body = rest.slice(0, bodyLen)
-      out += programOnStdin(out.slice(segStart)) ? body : body.replace(/[^\n]/g, ' ')
+      out += !all && programOnStdin(out.slice(segStart)) ? body : body.replace(/[^\n]/g, ' ')
       i += bodyLen
       continue
     }
@@ -147,7 +152,7 @@ export function blankInertHeredocs(text) {
   // A data heredoc stays data only while nothing in the command can turn it into a program or into
   // arguments. When the command also pipes into an interpreter or shell, or runs eval / source / `.`,
   // xargs or a `read` loop, every body is judged as it is written (fail toward reading).
-  return BODY_SINK.test(out) ? src : out
+  return !all && BODY_SINK.test(out) ? src : out
 }
 const BODY_SINK = new RegExp([
   String.raw`\|\s*(?:(?:[A-Za-z_]\w*=\S*|env|command|exec|nohup|sudo|time)\s+)*(?:\S*\/)?(?:python[\d.]*|node(?:js)?|perl|ruby|php|deno|bun|osascript|bash|sh|zsh|dash|ksh|fish)\b`,
@@ -213,25 +218,24 @@ const SEPARATORS = /[\s'"`;|&()<>=:,]+/
 function pieces(s) { return s.split(SEPARATORS).filter((x) => x && /[A-Za-z]/.test(x)) }
 
 // The first brace list in a word that bash expands ({a,b}; not ${VAR} and not a comma-less {x}), as
-// its variants, or null.
+// its variants, or null. One pass with a stack, so an unmatched `{` costs no rescan.
 function firstBraceList(w) {
-  for (let i = 0; i < w.length; i++) {
-    if (w[i] !== '{' || w[i - 1] === '$') continue
-    let depth = 0
-    let j = i
-    const commas = []
-    for (; j < w.length; j++) {
-      if (w[j] === '{') depth++
-      else if (w[j] === '}' && --depth === 0) break
-      else if (w[j] === ',' && depth === 1) commas.push(j)
+  const stack = []
+  let best = null
+  for (let k = 0; k < w.length; k++) {
+    const c = w[k]
+    if (c === '{') stack.push({ at: k, isVar: w[k - 1] === '$', commas: [] })
+    else if (c === ',' && stack.length) stack[stack.length - 1].commas.push(k)
+    else if (c === '}' && stack.length) {
+      const g = stack.pop()
+      if (!g.isVar && g.commas.length && (!best || g.at < best.at)) best = { ...g, end: k }
     }
-    if (j >= w.length || !commas.length) continue
-    const variants = []
-    let from = i + 1
-    for (const c of [...commas, j]) { variants.push(w.slice(0, i) + w.slice(from, c) + w.slice(j + 1)); from = c + 1 }
-    return variants
   }
-  return null
+  if (!best) return null
+  const variants = []
+  let from = best.at + 1
+  for (const c of [...best.commas, best.end]) { variants.push(w.slice(0, best.at) + w.slice(from, c) + w.slice(best.end + 1)); from = c + 1 }
+  return variants
 }
 
 // Brace expansion, iterative and bounded: at most MAX_BRACE finished words and MAX_BRACE_STEPS list
@@ -240,7 +244,10 @@ function firstBraceList(w) {
 // says `truncated`, and the caller counts it as a finding.
 const MAX_BRACE = 64
 const MAX_BRACE_STEPS = 256
+const MAX_BRACE_WORD = 4096
 export function braceExpand(word) {
+  // A cheap cap first: a word this long, or with this many braces, is not read at all (a finding).
+  if (word.length > MAX_BRACE_WORD || (word.match(/\{/g) ?? []).length > MAX_BRACE_STEPS) return { words: [], truncated: true }
   const words = []
   const work = [word]
   let steps = 0
@@ -326,8 +333,13 @@ export function findSecretReads(command, { cwd = process.cwd(), home = homedir()
   if (homeInCode) bases.push(home)
 
   // Brace lists are expanded on whole words, before the cut: the cut splits on the comma.
-  const expanded = words.map(braceExpand)
-  const candidates = new Set([...pieces(text), ...expanded.flatMap((e) => e.words.flatMap(pieces))])
+  // Bash brace-expands its own unquoted words only, never a heredoc body or the code of a -c / -e
+  // string: the expansion (and its over-budget finding) runs on the command's shell words, cut on
+  // whitespace with every heredoc body blanked, so a JSON or PHP body is not read as a brace list.
+  const shellTokens = blankInertHeredocs(String(command ?? '').replace(/\\\r?\n/g, ' '), { all: true })
+    .split(/\s+/).filter((t) => t.includes('{'))
+  const expanded = shellTokens.flatMap((t) => shellWords(t)).map(braceExpand)
+  const candidates = new Set([...pieces(text), ...words.flatMap(pieces), ...expanded.flatMap((e) => e.words.flatMap(pieces))])
   const ruleList = rules(home, root, caseInsensitive)
   const homePrefix = foldCase(caseInsensitive)(home + sep)
   const hits = []
@@ -347,7 +359,9 @@ export function findSecretReads(command, { cwd = process.cwd(), home = homedir()
     }
   }
   for (const raw of candidates) {
-    for (const variant of braceExpand(raw).words) {
+    const e = braceExpand(raw)
+    // Over the cap a piece is still judged as written; the word-level finding above covers the rest.
+    for (const variant of (e.words.length ? e.words : [raw])) {
       const x = expandVars(variant, vars, home)
       // `process.env.HOME + '/.ssh/x'`: next to code that builds a home path, a leading `/` piece is
       // also read as home-relative.

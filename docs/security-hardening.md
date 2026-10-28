@@ -812,7 +812,9 @@ through. `scripts/hooks/secret-read-gate.mjs` judges every Bash call of every su
 main agent) and catches a command that **refers** to a secret path, whatever the program:
 
 - protected: `~/.ssh/**`, `~/.aws/**`, `~/.gnupg/**`, `~/Library/Keychains/**`, `~/.claude.json`
-  (and its backups), `store/vault*`, `store/.claude-oauth-token`, and by file name `.env`, `.env.*`
+  (and its backups), `store/vault*`, `store/.claude-oauth-token`, the other store credentials
+  (`store/.fal-key*`, `store/.fb-page-token`, `store/.launch-secrets`, `store/*-mcp-key*.txt`; their own
+  scripts read them inside and run untouched), and by file name `.env`, `.env.*`
   (not `.env.example` / `.sample` / `.template` / `.dist`), `service-account*.json`, `*.pem`, `*.key`;
 - always free: `store/.dashboard-token`, read in every dashboard call;
 - read forms: `~`, `$HOME`, `${HOME}`, absolute and relative (against the cwd and every `cd` in the
@@ -833,11 +835,12 @@ warn mode. The setting reaches the agents as the hook's `--block` argument at th
 It is deliberately not a store file: a sub-agent could rewrite one to switch itself back to warn.
 
 `SECRET_READ_DENY` in `agent-scaffold.ts` is the second layer, on the same sub-agents:
-`Read(~/.claude.json)`, `Read(store/vault*)`, `Read(store/.claude-oauth-token)` and the two exact
+`Read(~/.claude.json)`, `Read(store/vault*)`, `Read(store/.claude-oauth-token)`, the four store
+credential rules above, and the two exact
 `cat ~/.ssh/*`, `cat ~/.aws/*` text rules. It is not in `FLEET_BASELINE_DENY`, because that list is
 also the main agent's floor (the tracked `.claude/settings.json`, which binds the owner's own sessions
 in this repo too), and the main agent reads the HarderPM key from `~/.claude.json`.
 
 **Not covered, stated out loud:** a script written to a file and run afterwards (the hook sees its
 name only); a path assembled at run time from pieces; a relative path behind a `cd` an earlier call
-made; secret files not on the list (`store/.fal-key`, `store/*-mcp-key.txt`, `store/.fb-page-token`).
+made; a secret file that is not on the list.
