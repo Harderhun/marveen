@@ -258,11 +258,32 @@ const MAX_BRACE_WORD = 4096
 const MAX_BRACE_TOKENS = 512
 const MAX_LINEAR = 1024
 const MAX_BRACE_CHARS = 4_000_000
+// A command longer than this is not brace-expanded at all: an unreadable-braces finding, fail-closed
+// in block mode. It bounds every expansion budget below by one number, whatever the word looks like.
+// 64 KB: none of 9118 measured agent commands came near it (the longest was 18.6 KB), while a command
+// just under 256 KB ran 3.5 s alone and 10.6 s under load, against a 10 s hook timeout.
+export const MAX_COMMAND_CHARS = 64 * 1024
 // The fallback when a word does not fit the full expansion: every alternative of every top-level brace
 // list once, with the other lists set to their first alternative, and once with them removed. Linear in
 // the number of alternatives instead of their product. It does not reproduce every combination, but the
 // directory rules are prefix rules, so the alternative that names .ssh / .aws is always among them,
 // whatever padding the other lists add.
+// Does the word hold a brace list inside another list? One stack pass (a regex for it backtracks
+// quadratically on a long word: measured 19 s on a 250 KB one).
+export function hasNestedList(word) {
+  const stack = []
+  for (let k = 0; k < word.length; k++) {
+    const c = word[k]
+    if (c === '{') stack.push({ isVar: word[k - 1] === '$', commas: false })
+    else if (c === ',' && stack.length) stack[stack.length - 1].commas = true
+    else if (c === '}' && stack.length) {
+      const g = stack.pop()
+      if (!g.isVar && g.commas && stack.some((o) => !o.isVar)) return true
+    }
+  }
+  return false
+}
+
 export function linearBraceVariants(word) {
   const groups = []
   const stack = []
@@ -287,10 +308,15 @@ export function linearBraceVariants(word) {
     groups.forEach((g, gi) => { out += word.slice(from, g.at) + pick(gi, g); from = g.end + 1 })
     return out + word.slice(from)
   }
-  // Every alternative of every list gets its "others removed" variant before any cap applies; the cap
-  // only trims the "others at their first alternative" set after it.
+  // The "others removed" variants come first, then "others at their first alternative"; both stop at
+  // MAX_LINEAR. The hard command-length cap in findSecretReads keeps the word itself bounded.
   const variants = new Set([build((_, g) => g.alts[0]), build(() => '')])
-  for (let i = 0; i < groups.length; i++) for (const alt of groups[i].alts) variants.add(build((gi) => (gi === i ? alt : '')))
+  for (let i = 0; i < groups.length && variants.size < MAX_LINEAR; i++) {
+    for (const alt of groups[i].alts) {
+      variants.add(build((gi) => (gi === i ? alt : '')))
+      if (variants.size >= MAX_LINEAR) break
+    }
+  }
   for (let i = 0; i < groups.length && variants.size < MAX_LINEAR; i++) {
     for (const alt of groups[i].alts) {
       variants.add(build((gi, g) => (gi === i ? alt : g.alts[0])))
@@ -395,7 +421,8 @@ export function findSecretReads(command, { cwd = process.cwd(), home = homedir()
   // only in shell text (the command's words and the bodies a shell runs or the command pipes on, plus
   // a body with a recognised shell-out), where bash really expands; a program body over the budget is
   // judged as written. The number of brace words is bounded per command too.
-  const braceTokens = (t) => t.split(/\s+/).filter((x) => x.includes('{')).flatMap((x) => shellWords(x))
+  const tooLong = String(command ?? '').length > MAX_COMMAND_CHARS
+  const braceTokens = (t) => (tooLong ? [] : t.split(/\s+/).filter((x) => x.includes('{')).flatMap((x) => shellWords(x)))
   const shellText = new Set(braceTokens(blankInertHeredocs(String(command ?? '').replace(/\\\r?\n/g, ' '), { shellOnly: true })))
   // Deduplicated; past the per-command budget a word gets the linear fallback, never nothing. The total
   // work is capped as well (MAX_BRACE_CHARS over all variants): past it, no more expansion, a finding.
@@ -407,7 +434,7 @@ export function findSecretReads(command, { cwd = process.cwd(), home = homedir()
     if (budget <= 0) { overWork = true; break }
     const e = n < MAX_BRACE_TOKENS ? braceExpand(t) : { words: linearBraceVariants(t), truncated: true }
     // A list nested in a fallback word's alternative is not expanded by the linear fallback: unreadable.
-    const nested = e.truncated && /\{[^{}]*,[^{}]*\{[^{}]*,/.test(t)
+    const nested = e.truncated && hasNestedList(t)
     budget -= e.words.reduce((a, w) => a + w.length, 0)
     expanded.push({ ...e, shell: shellText.has(t), pathShaped: /[~/]/.test(t), nested })
   }
@@ -420,7 +447,8 @@ export function findSecretReads(command, { cwd = process.cwd(), home = homedir()
   // PATH-SHAPED (holds `~` or `/`) anywhere: the linear variants are not every combination. A program-body
   // word with neither is not a finding, because JSON / PHP bodies would then deny ordinary work. So is a
   // command past the total work budget, and a fallback word with a nested list.
-  if (overWork || expanded.some((e) => e.truncated && (e.shell || e.pathShaped || e.nested))) hits.push({ rule: 'unreadable-braces', pattern: `brace expansion over ${MAX_BRACE} words`, path: '-' })
+  if (tooLong) hits.push({ rule: 'unreadable-braces', pattern: `command over ${MAX_COMMAND_CHARS} characters`, path: '-' })
+  else if (overWork || expanded.some((e) => e.truncated && (e.shell || e.pathShaped || e.nested))) hits.push({ rule: 'unreadable-braces', pattern: `brace expansion over ${MAX_BRACE} words`, path: '-' })
   const seen = new Set()
   const judge = (abs) => {
     for (const p of [abs, realOrNull(abs)]) {

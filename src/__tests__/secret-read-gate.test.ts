@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 // @ts-expect-error -- plain .mjs hook script, no types
-import { findSecretReads, blankInertHeredocs, readMode, agentOf } from '../../scripts/hooks/secret-read-gate.mjs'
+import { findSecretReads, blankInertHeredocs, readMode, agentOf, linearBraceVariants } from '../../scripts/hooks/secret-read-gate.mjs'
 import {
   SECRET_READ_DENY,
   FLEET_BASELINE_DENY,
@@ -263,6 +263,27 @@ describe('review fixes', () => {
     expect(rulesOf(`bash ${root}/scripts/agent-msg.sh soma marveen - <<'EOF'\n~/.ssh/config\nEOF`)).toEqual([])
   })
 
+  it('a command over the hard length cap is a finding before any expansion', () => {
+    const long = 'echo ' + 'x'.repeat(64 * 1024)
+    expect(rulesOf(long)).toEqual(['unreadable-braces'])
+    expect(rulesOf('echo ' + 'x'.repeat(1000))).toEqual([])
+  })
+
+  it('a long word with many alternatives stays inside the linear cap and finishes fast', () => {
+    // Over 4096 characters, so the linear fallback takes the word, and under the 64 KB command cap, so
+    // the cap does not take it first: 5000 alternatives next to a 30 KB tail would be 5000 variants of
+    // 30 KB each (150 MB) without the MAX_LINEAR cap.
+    const word = '/x/{' + Array.from({ length: 5000 }, (_, n) => `a${n}`).join(',') + '}/' + 'y'.repeat(30 * 1024)
+    expect(word.length).toBeLessThan(64 * 1024 - 10)
+    // Deterministic: the fallback yields at most MAX_LINEAR (1024) variants; uncapped it is 5002.
+    expect(linearBraceVariants(word).length).toBeLessThanOrEqual(1024)
+    // And the whole judgement stays fast (about 1 s alone; under the 64 KB command cap even the
+    // uncapped loop measured 3.8 s, so this bound alone could not tell the two apart).
+    const t0 = performance.now()
+    hits(`cat ${word}`)
+    expect(performance.now() - t0).toBeLessThan(5000)
+  })
+
   it('brace expansion is bounded, and a word over the budget is a finding, never a pass', () => {
     // ${HOME} and comma-less {x} are not brace lists, so padding with them changes nothing.
     expect(rulesOf('cat ~/.{ssh,x}/config' + '${HOME}'.repeat(40) + '{y}'.repeat(40))).toContain('ssh')
@@ -294,7 +315,7 @@ describe('review fixes', () => {
     // fallback word and a command past the total work budget.
     expect(rulesOf("python3 - <<'PY'\nimport os\ngetattr(os, 'sys' + 'tem')('cat " + '{a,b}'.repeat(300) + "~/.{x,{y,ssh}}/config')\nPY")).toContain('unreadable-braces')
     expect(rulesOf("python3 - <<'PY'\nimport os\ngetattr(os, 'sys' + 'tem')('cat ~/." + '{a,b}'.repeat(80) + "{x,s{s,y}h}/config')\nPY")).toContain('unreadable-braces')
-    expect(rulesOf("python3 - <<'PY'\n" + Array.from({ length: 3000 }, (_, n) => `v${n}='{' + '${'x,'.repeat(300)}y' + '}'`).join('\n') + "\nPY")).toEqual([])
+    expect(rulesOf("python3 - <<'PY'\n" + Array.from({ length: 90 }, (_, n) => `v${n}='{' + '${'x,'.repeat(300)}y' + '}'`).join('\n') + "\nPY")).toEqual([])
     // ... but a DATA body that merely mentions a shell-out stays data.
     expect(rulesOf("cat > probe.mjs <<'EOF'\nexecSync('cat ~/.{ssh,aws}/config')\nEOF")).toEqual([])
     // A JSON or PHP body in a program heredoc is code, not a brace list.
